@@ -4,6 +4,8 @@ import (
 	"log"
 	"os"
 	"netstack/pkg/lnxconfig"
+	"netstack/pkg/ipstack"
+	"netstack/pkg/repl"
 )
 
 func main() {
@@ -15,8 +17,12 @@ func main() {
 	if err != nil {
 		log.Fatalln(err)
 	}
-	log.Println(lnxConfig.Interfaces[0].AssignedIP.String())
-	for {
+	// Create the ipstack
+	ipStack := ipstack.CreateIPStack()
+	// Initialize the ipstack
+	ipStack.Initialize(lnxConfig)
 
-	}
+	// Start the REPL
+	r := repl.CreateREPL(ipStack)
+	r.StartREPL()
 }
