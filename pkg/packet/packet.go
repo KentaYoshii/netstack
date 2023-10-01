@@ -1,6 +1,7 @@
 package packet
 
 import (
+	"net/netip"
 	"netstack/pkg/util"
 )
 
@@ -18,4 +19,12 @@ func (p *Packet) Marshal() []byte {
 	b := copy(totalBytes, headerBytes)
 	copy(totalBytes[b:], p.Payload)
 	return totalBytes
+}
+
+func CreateNewPacket(payload []byte, sender netip.Addr, dest netip.Addr, proto int) *Packet {
+	header := util.CreateHeaderFrom(payload, sender, dest, proto)
+	return &Packet{
+		IPHeader: header,
+		Payload: payload,
+	}
 }

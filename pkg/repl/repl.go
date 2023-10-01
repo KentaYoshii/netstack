@@ -3,7 +3,9 @@ package repl
 import (
 	"bufio"
 	"fmt"
+	"net/netip"
 	"netstack/pkg/ipstack"
+	"netstack/pkg/packet"
 	"os"
 	"strings"
 )
@@ -54,16 +56,22 @@ func (r *Repl) StartREPL() {
 	// Register Commands
 	r.RegisterCommandHandler("li", r.handleListInterface)
 	r.RegisterCommandHandler("ln", r.handleListNeighbors)
-	
+	r.RegisterCommandHandler("echo", r.handleEcho)
+	r.RegisterCommandHandler("help", r.handleHelp)
+	r.RegisterCommandHandler("send", r.handleSend)
+
 	fmt.Printf("> ")
 	for r.Scanner.Scan() {
 		// Split
 		tokens := strings.Fields(r.Scanner.Text())
+		if tokens[0] == "exit" {
+			break
+		}
 		// Get handler
 		handler, ok := r.CommandHandlerMap[tokens[0]]
 		if !ok {
 			// No handler
-			r.WriteOutput("Command not supported. Type h to see the supported commands\n", true)
+			r.WriteOutput("Command not supported. Type help to see the supported commands\n", true)
 			continue
 		}
 		// Handle
@@ -96,6 +104,7 @@ func (r *Repl) handleListInterface(args []string) string {
 	return b.String()
 }
 
+// Handle "ln" command
 func (r *Repl) handleListNeighbors(args []string) string {
 	var b strings.Builder
 	b.WriteString(fmt.Sprintf("%-6s %-15s %s\n", "-----", "---", "-------"))
@@ -104,5 +113,59 @@ func (r *Repl) handleListNeighbors(args []string) string {
 	for _, nei := range r.HostInfo.Neighbors {
 		b.WriteString(fmt.Sprintf("%-6s %-15s %s\n", nei.InterfaceAt, nei.VirtualIPAddr, nei.MacAddr))
 	}
+	return b.String()
+}
+
+// Handle "echo" command
+func (r *Repl) handleEcho(args []string) string {
+	var b strings.Builder
+	b.WriteString(strings.Join(args[1:], " ") + "\n")
+	return b.String()
+}
+
+// Handle "help" command
+func (r *Repl) handleHelp(args []string) string {
+	var b strings.Builder
+	b.WriteString(fmt.Sprintf("%-6s %-15s\n", "-------", "-----------"))
+	b.WriteString(fmt.Sprintf("%-6s %-15s\n", "Command", "Description"))
+	b.WriteString(fmt.Sprintf("%-6s %-15s\n", "-------", "-----------"))
+	b.WriteString(fmt.Sprintf("%-6s %-15s\n", "echo", "Command Test"))
+	b.WriteString(fmt.Sprintf("%-6s %-15s\n", "exit", "Terminate this program"))
+	b.WriteString(fmt.Sprintf("%-6s %-15s\n", "li", "List interfaces"))
+	b.WriteString(fmt.Sprintf("%-6s %-15s\n", "lr", "List routes"))
+	b.WriteString(fmt.Sprintf("%-6s %-15s\n", "ln", "List available neighbors"))
+	b.WriteString(fmt.Sprintf("%-6s %-15s\n", "up", "Enable an interface"))
+	b.WriteString(fmt.Sprintf("%-6s %-15s\n", "down", "Disable an interface"))
+	b.WriteString(fmt.Sprintf("%-6s %-15s\n", "send", "Send test packet"))
+	return b.String()
+}
+
+// Handle "send" command
+func (r *Repl) handleSend(args []string) string {
+	var b strings.Builder
+	if len(args) != 3 {
+		b.WriteString("Usage:  send <dest ip> <message>\n")
+		return b.String()
+	}
+	destAddr, err := netip.ParseAddr(args[1])
+	if err != nil {
+		b.WriteString(err.Error())
+		return b.String()
+	}
+	// Get the outgoing interface vip
+	var srcAddr netip.Addr
+	check, name := r.HostInfo.IsThisMySubnet(destAddr)
+	if check {
+		srcAddr = r.HostInfo.InterfaceToVIP[name]
+	} else {
+		nextHop := r.HostInfo.GetNextHop(destAddr)
+		srcAddr = r.HostInfo.Neighbors[nextHop].VirtualIPAddr
+	}
+	// Get the payload
+	payloadString := strings.Join(args[2:], " ")
+	newPacket := packet.CreateNewPacket([]byte(payloadString), srcAddr, destAddr, 0)
+	r.HostInfo.IpPacketChan <- newPacket
+	// b.WriteString(fmt.Sprintf("src: %s, dst: %s\n", srcAddr.String(), destAddr.String()))
+	b.WriteString(fmt.Sprintf("Sent %d bytes!\n", len(payloadString)))
 	return b.String()
 }

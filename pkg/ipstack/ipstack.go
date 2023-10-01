@@ -8,6 +8,7 @@ import (
 	"netstack/pkg/lnxconfig"
 	"netstack/pkg/packet"
 	"netstack/pkg/util"
+	"netstack/pkg/proto"
 	"os"
 )
 
@@ -57,11 +58,12 @@ type IpStack struct {
 	ProtocolHandlerMap map[uint8]ProtocolHandler
 	// Forwarding Table (map from Network Prefix to NextHop IP)
 	ForwardingTable map[netip.Prefix]netip.Addr
-	
+	// Map from interface name to VIP
+	InterfaceToVIP map[string]netip.Addr
 	// Channels
 
 	// Channel through whicn interfaces send IP packets to network layer
-	ipPacketChan chan *packet.Packet
+	IpPacketChan chan *packet.Packet
 	// Channel for getting non-serious error messages
 	errorChan chan string
 
@@ -78,7 +80,8 @@ func CreateIPStack() *IpStack {
 		Subnets: make(map[netip.Prefix]*InterfaceInfo),
 		ProtocolHandlerMap: make(map[uint8]ProtocolHandler),
 		ForwardingTable: make(map[netip.Prefix]netip.Addr),
-		ipPacketChan: make(chan *packet.Packet, 100),
+		InterfaceToVIP: make(map[string]netip.Addr),
+		IpPacketChan: make(chan *packet.Packet, 100),
 		errorChan: make(chan string, 100),
 	}
 }
@@ -104,6 +107,7 @@ func (ip *IpStack) Initialize(config *lnxconfig.IPConfig) {
 	}
 	// Load in the Interface Information
 	for _, i := range config.Interfaces {
+		ip.InterfaceToVIP[i.Name] = i.AssignedIP
 		ip.Subnets[i.AssignedPrefix] = &InterfaceInfo{
 			VirtualIPAddr: i.AssignedIP,
 			MacAddr: i.UDPAddr,
@@ -129,8 +133,15 @@ func (ip *IpStack) Initialize(config *lnxconfig.IPConfig) {
 		ip.ForwardingTable[k] = v
 	}
 
+	// Setup protocol handlers
+	// TEST
+	ip.ProtocolHandlerMap[0] = proto.HandleTestProtocol
+	// TODO: RIP, ICMP
+
 	// Initialize the interfaces and start listening
 	ip.InitializeInterfaces()
+	// Start processing incoming packets
+	go ip.ProcessPackets()
 }
 
 // Register a handler
@@ -150,7 +161,7 @@ func (ip *IpStack) InitializeInterfaces() {
 			panic(err)
 		}
 		i.ListenConn = conn
-		go link.ListenAtInterface(conn, ip.ipPacketChan, ip.errorChan)
+		go link.ListenAtInterface(conn, ip.IpPacketChan, ip.errorChan)
 	}
 }
 
@@ -158,15 +169,15 @@ func (ip *IpStack) InitializeInterfaces() {
 func (ip *IpStack) ProcessPackets() {
 	for {
 		select {
-		case packet := <- ip.ipPacketChan:
-			if ip.IsThisMyPacket(packet) {
+		case packet := <- ip.IpPacketChan:
+			if ip.IsThisMyPacket(packet.IPHeader.Dst) {
 				// Dst == one of our ifs
 				// - Invoke the handler
 				ip.ProtocolHandlerMap[uint8(packet.IPHeader.Protocol)](packet)
 				continue
 			}
 			// Get next hop
-			nextHop := ip.GetNextHop(packet)
+			nextHop := ip.GetNextHop(packet.IPHeader.Dst)
 			neighbor := ip.Neighbors[nextHop]
 			// Forward the packet
 			ip.SendPacketTo(packet, neighbor, true)
@@ -178,9 +189,8 @@ func (ip *IpStack) ProcessPackets() {
 	}
 }
 
-// Helper to check if this packet is destined to me
-func (ip *IpStack) IsThisMyPacket(packet *packet.Packet) bool {
-	dst := packet.IPHeader.Dst
+// Helper to check if this packet is destined to one of my interfaces
+func (ip *IpStack) IsThisMyPacket(dst netip.Addr) bool {
 	for _, i := range ip.Subnets {
 		if dst.Compare(i.VirtualIPAddr) == 0 {
 			// This is for me
@@ -190,9 +200,19 @@ func (ip *IpStack) IsThisMyPacket(packet *packet.Packet) bool {
 	return false
 }
 
-func (ip *IpStack) GetNextHop(forPacket *packet.Packet) netip.Addr {
+func (ip *IpStack) IsThisMySubnet(dst netip.Addr) (bool, string) {
+	for _, i := range ip.Subnets {
+		if i.Subnet.Contains(dst) {
+			return true, i.InterfaceName
+		}
+	}
+	return false, ""
+}
+
+func (ip *IpStack) GetNextHop(dst netip.Addr) netip.Addr {
+	// Check Forwarding Table
 	for prefix, nihop := range ip.ForwardingTable {
-		if prefix.Contains(forPacket.IPHeader.Dst) {
+		if prefix.Contains(dst) {
 			return nihop
 		}
 	}

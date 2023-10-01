@@ -51,6 +51,25 @@ type IPv4Header struct {
 	Options  []byte      // options, extension headers
 }
 
+func CreateHeaderFrom(payload []byte, sender netip.Addr, dest netip.Addr, proto int) *IPv4Header {
+	return &IPv4Header{
+		Version: Version,
+		Len: HeaderLen,
+		TOS: 0,
+		TotalLen: HeaderLen + len(payload),
+		ID: 0,
+		Flags: DontFragment,
+		FragOff: 0,
+		TTL: 16,
+		Protocol: proto,
+		Checksum: 0,
+		Src: sender,
+		Dst: dest,
+		Options: []byte{},
+	}
+}
+
+
 func (h *IPv4Header) String() string {
 	if h == nil {
 		return "<nil>"
