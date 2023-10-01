@@ -7,8 +7,8 @@ import (
 	"netstack/pkg/link"
 	"netstack/pkg/lnxconfig"
 	"netstack/pkg/packet"
-	"netstack/pkg/util"
 	"netstack/pkg/proto"
+	"netstack/pkg/util"
 	"os"
 )
 
@@ -19,8 +19,10 @@ type NeighborInfo struct {
 	VirtualIPAddr netip.Addr
 	// MAC of neighbor node
 	MacAddr netip.AddrPort
-	// UDP conn for communicating with this neighbor
-	NeighborConn *net.UDPConn
+	// // UDP conn for communicating with this neighbor
+	// NeighborConn *net.UDPConn
+	// UDP addr
+	NeighborUDPAddr *net.UDPAddr
 	// Interface to talk to this neighbor
 	InterfaceAt string
 }
@@ -35,7 +37,7 @@ type InterfaceInfo struct {
 	// Name of the interface
 	InterfaceName string
 	// Subnet
-	Subnet  netip.Prefix
+	Subnet netip.Prefix
 	// State (up/down)
 	IsUp bool
 }
@@ -54,12 +56,16 @@ type IpStack struct {
 	Neighbors map[netip.Addr]*NeighborInfo
 	// Map from Subnet IP address to InterfaceInfo Struct
 	Subnets map[netip.Prefix]*InterfaceInfo
-	// Map for protocol number to higher layer handler function 
+	// Map for protocol number to higher layer handler function
 	ProtocolHandlerMap map[uint8]ProtocolHandler
 	// Forwarding Table (map from Network Prefix to NextHop IP)
 	ForwardingTable map[netip.Prefix]netip.Addr
 	// Map from interface name to VIP
 	InterfaceToVIP map[string]netip.Addr
+	// Map from interface name to prefix
+	InterfaceToPrefix map[string]netip.Prefix
+	// Map from VIP to UDP
+	VIPToUDP map[netip.Addr]netip.AddrPort
 	// Channels
 
 	// Channel through whicn interfaces send IP packets to network layer
@@ -74,46 +80,52 @@ type IpStack struct {
 // Create new IP stack
 func CreateIPStack() *IpStack {
 	return &IpStack{
-		Writer: bufio.NewWriter(os.Stdout),
-		RipEnabled: false,
-		Neighbors: make(map[netip.Addr]*NeighborInfo),
-		Subnets: make(map[netip.Prefix]*InterfaceInfo),
+		Writer:             bufio.NewWriter(os.Stdout),
+		RipEnabled:         false,
+		Neighbors:          make(map[netip.Addr]*NeighborInfo),
+		Subnets:            make(map[netip.Prefix]*InterfaceInfo),
 		ProtocolHandlerMap: make(map[uint8]ProtocolHandler),
-		ForwardingTable: make(map[netip.Prefix]netip.Addr),
-		InterfaceToVIP: make(map[string]netip.Addr),
-		IpPacketChan: make(chan *packet.Packet, 100),
-		errorChan: make(chan string, 100),
+		ForwardingTable:    make(map[netip.Prefix]netip.Addr),
+		InterfaceToVIP:     make(map[string]netip.Addr),
+		InterfaceToPrefix: make(map[string]netip.Prefix),
+		VIPToUDP: make(map[netip.Addr]netip.AddrPort),
+		IpPacketChan:       make(chan *packet.Packet, 100),
+		errorChan:          make(chan string, 100),
 	}
 }
 
 // Given "config", initialize the ip struct
 func (ip *IpStack) Initialize(config *lnxconfig.IPConfig) {
+	// Load in the Interface Information
+	for _, i := range config.Interfaces {
+		ip.InterfaceToPrefix[i.Name] = i.AssignedPrefix
+		ip.InterfaceToVIP[i.Name] = i.AssignedIP
+		ip.VIPToUDP[i.AssignedIP] = i.UDPAddr
+		ip.Subnets[i.AssignedPrefix] = &InterfaceInfo{
+			VirtualIPAddr: i.AssignedIP,
+			MacAddr:       i.UDPAddr,
+			InterfaceName: i.Name,
+			Subnet:        i.AssignedPrefix,
+			IsUp:          true,
+		}
+	}
 	// Load in the Neighbors Information
 	for _, n := range config.Neighbors {
 		neighborUDPAddr, err := net.ResolveUDPAddr("udp4", n.UDPAddr.String())
 		if err != nil {
 			panic(err)
 		}
-		neighborConn, err := net.DialUDP("udp4", nil, neighborUDPAddr)
-		if err != nil {
-			panic(err)
-		}
+		
+		// neighborConn, err := net.DialUDP("udp4", nil, neighborUDPAddr)
+		// if err != nil {
+		// 	panic(err)
+		// }
 		ip.Neighbors[n.DestAddr] = &NeighborInfo{
-			VirtualIPAddr: n.DestAddr,
-			MacAddr: n.UDPAddr,
-			NeighborConn: neighborConn,
-			InterfaceAt: n.InterfaceName,
-		}
-	}
-	// Load in the Interface Information
-	for _, i := range config.Interfaces {
-		ip.InterfaceToVIP[i.Name] = i.AssignedIP
-		ip.Subnets[i.AssignedPrefix] = &InterfaceInfo{
-			VirtualIPAddr: i.AssignedIP,
-			MacAddr: i.UDPAddr,
-			InterfaceName: i.Name,
-			Subnet: i.AssignedPrefix,
-			IsUp: true,
+			VirtualIPAddr:   n.DestAddr,
+			MacAddr:         n.UDPAddr,
+			// NeighborConn:    neighborConn,
+			NeighborUDPAddr: neighborUDPAddr,
+			InterfaceAt:     n.InterfaceName,
 		}
 	}
 	// Check if RIP is enabled
@@ -136,7 +148,7 @@ func (ip *IpStack) Initialize(config *lnxconfig.IPConfig) {
 	// Setup protocol handlers
 	// TEST
 	ip.ProtocolHandlerMap[0] = proto.HandleTestProtocol
-	// TODO: RIP, ICMP
+	// TODO: Add RIP, ICMP handlers
 
 	// Initialize the interfaces and start listening
 	ip.InitializeInterfaces()
@@ -169,20 +181,29 @@ func (ip *IpStack) InitializeInterfaces() {
 func (ip *IpStack) ProcessPackets() {
 	for {
 		select {
-		case packet := <- ip.IpPacketChan:
+		case packet := <-ip.IpPacketChan:
 			if ip.IsThisMyPacket(packet.IPHeader.Dst) {
-				// Dst == one of our ifs
+				// Dst == one of our interfaces
 				// - Invoke the handler
 				ip.ProtocolHandlerMap[uint8(packet.IPHeader.Protocol)](packet)
 				continue
 			}
-			// Get next hop
-			nextHop := ip.GetNextHop(packet.IPHeader.Dst)
-			neighbor := ip.Neighbors[nextHop]
-			// Forward the packet
+			var neighbor *NeighborInfo
+			if check, _ := ip.IsThisMySubnet(packet.IPHeader.Dst); check {
+				// Dst is in one of our direct subnets
+				// - Just send to dst that directly through link
+				neighbor = ip.Neighbors[packet.IPHeader.Dst]
+			} else {
+				// Dst is somewhere else
+				// - Forward
+				// Get next hop
+				nextHop := ip.GetNextHop(packet.IPHeader.Dst)
+				neighbor = ip.Neighbors[nextHop]
+			}
+			// Dispatch the packet
 			ip.SendPacketTo(packet, neighbor, true)
-		
-		case errStr := <- ip.errorChan:
+
+		case errStr := <-ip.errorChan:
 			ip.Writer.WriteString("\nERROR: " + errStr)
 			ip.Writer.Flush()
 		}
@@ -241,5 +262,8 @@ func (ip *IpStack) SendPacketTo(packet *packet.Packet, to *NeighborInfo, forward
 	packet.IPHeader.Checksum = int(newCheckSum)
 	// Forward
 	packetBytes := packet.Marshal()
-	to.NeighborConn.WriteTo(packetBytes, to.NeighborConn.RemoteAddr())
+	// Get the conn
+	prefix, _ := ip.InterfaceToPrefix[to.InterfaceAt]
+	conn := ip.Subnets[prefix].ListenConn
+	_, err = conn.WriteToUDP(packetBytes, to.NeighborUDPAddr)
 }

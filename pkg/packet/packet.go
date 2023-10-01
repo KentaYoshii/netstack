@@ -5,7 +5,6 @@ import (
 	"netstack/pkg/util"
 )
 
-
 type Packet struct {
 	// IPv4 Header
 	IPHeader *util.IPv4Header
@@ -13,6 +12,7 @@ type Packet struct {
 	Payload []byte
 }
 
+// Marshal the packet struct
 func (p *Packet) Marshal() []byte {
 	totalBytes := make([]byte, util.MAX_PACKET_SIZE)
 	headerBytes, _ := p.IPHeader.Marshal()
@@ -21,6 +21,7 @@ func (p *Packet) Marshal() []byte {
 	return totalBytes
 }
 
+// Create a new IP packet with the info passed in 
 func CreateNewPacket(payload []byte, sender netip.Addr, dest netip.Addr, proto int) *Packet {
 	header := util.CreateHeaderFrom(payload, sender, dest, proto)
 	return &Packet{

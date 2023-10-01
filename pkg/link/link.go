@@ -14,16 +14,19 @@ import (
 func ListenAtInterface(conn *net.UDPConn, packetChan chan *packet.Packet, errorChan chan string) { 
 	for {
 		buf := make([]byte, util.MAX_PACKET_SIZE)
-		_, err := conn.Read(buf)
+
+		_, _, err := conn.ReadFromUDP(buf)
 		if err != nil {
 			errorChan <- err.Error()
 			continue
 		}
+
 		header, err := util.ParseHeader(buf)
 		if err != nil {
 			errorChan <- err.Error()
 			continue
 		}
+
 		headerBytes := buf[:header.Len]
 		// Compute the Checksum to make sure packet is in good shape
 		originalCheckSum := uint16(header.Checksum)
