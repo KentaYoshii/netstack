@@ -172,3 +172,10 @@ func ValidateChecksum(b []byte, fromHeader uint16) uint16 {
 
 	return checksum
 }
+
+func ComputeChecksum(b []byte) uint16 {
+	checksum := header.Checksum(b, 0)
+	checksumInv := checksum ^ 0xffff
+
+	return checksumInv
+}

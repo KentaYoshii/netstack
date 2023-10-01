@@ -1,13 +1,14 @@
 package ipstack
 
 import (
-	"os"
 	"bufio"
 	"net"
 	"net/netip"
+	"netstack/pkg/link"
 	"netstack/pkg/lnxconfig"
 	"netstack/pkg/packet"
-	"netstack/pkg/link"
+	"netstack/pkg/util"
+	"os"
 )
 
 type ProtocolHandler func(*packet.Packet)
@@ -17,6 +18,8 @@ type NeighborInfo struct {
 	VirtualIPAddr netip.Addr
 	// MAC of neighbor node
 	MacAddr netip.AddrPort
+	// UDP conn for communicating with this neighbor
+	NeighborConn *net.UDPConn
 	// Interface to talk to this neighbor
 	InterfaceAt string
 }
@@ -41,6 +44,9 @@ type IpStack struct {
 	// Writer
 	Writer *bufio.Writer
 
+	// RIP enabled?
+	RipEnabled bool
+
 	// Maps
 
 	// Map from Neighbor IP address to NeighborInfo Struct
@@ -49,6 +55,8 @@ type IpStack struct {
 	Subnets map[netip.Prefix]*InterfaceInfo
 	// Map for protocol number to higher layer handler function 
 	ProtocolHandlerMap map[uint8]ProtocolHandler
+	// Forwarding Table (map from Network Prefix to NextHop IP)
+	ForwardingTable map[netip.Prefix]netip.Addr
 	
 	// Channels
 
@@ -56,15 +64,20 @@ type IpStack struct {
 	ipPacketChan chan *packet.Packet
 	// Channel for getting non-serious error messages
 	errorChan chan string
+
+	// ----- ROUTERS specific -----
+	RIPTo []netip.Addr
 }
 
 // Create new IP stack
 func CreateIPStack() *IpStack {
 	return &IpStack{
 		Writer: bufio.NewWriter(os.Stdout),
+		RipEnabled: false,
 		Neighbors: make(map[netip.Addr]*NeighborInfo),
 		Subnets: make(map[netip.Prefix]*InterfaceInfo),
 		ProtocolHandlerMap: make(map[uint8]ProtocolHandler),
+		ForwardingTable: make(map[netip.Prefix]netip.Addr),
 		ipPacketChan: make(chan *packet.Packet, 100),
 		errorChan: make(chan string, 100),
 	}
@@ -74,9 +87,18 @@ func CreateIPStack() *IpStack {
 func (ip *IpStack) Initialize(config *lnxconfig.IPConfig) {
 	// Load in the Neighbors Information
 	for _, n := range config.Neighbors {
+		neighborUDPAddr, err := net.ResolveUDPAddr("udp4", n.UDPAddr.String())
+		if err != nil {
+			panic(err)
+		}
+		neighborConn, err := net.DialUDP("udp4", nil, neighborUDPAddr)
+		if err != nil {
+			panic(err)
+		}
 		ip.Neighbors[n.DestAddr] = &NeighborInfo{
 			VirtualIPAddr: n.DestAddr,
 			MacAddr: n.UDPAddr,
+			NeighborConn: neighborConn,
 			InterfaceAt: n.InterfaceName,
 		}
 	}
@@ -90,8 +112,22 @@ func (ip *IpStack) Initialize(config *lnxconfig.IPConfig) {
 			IsUp: true,
 		}
 	}
-	// TODO: RIP and Static Routes
+	// Check if RIP is enabled
+	if config.RoutingMode == lnxconfig.RoutingTypeRIP {
+		ip.RipEnabled = true
+	} else {
+		ip.RipEnabled = false
+	}
+	// (ROUTER): set neighbors
+	if ip.RipEnabled {
+		ip.RIPTo = config.RipNeighbors
+	}
 
+	// Set up Forwarding table
+	// Static Routes (default gateway)
+	for k, v := range config.StaticRoutes {
+		ip.ForwardingTable[k] = v
+	}
 
 	// Initialize the interfaces and start listening
 	ip.InitializeInterfaces()
@@ -129,7 +165,11 @@ func (ip *IpStack) ProcessPackets() {
 				ip.ProtocolHandlerMap[uint8(packet.IPHeader.Protocol)](packet)
 				continue
 			}
-			// TODO: Forward the packet using the forwarding table
+			// Get next hop
+			nextHop := ip.GetNextHop(packet)
+			neighbor := ip.Neighbors[nextHop]
+			// Forward the packet
+			ip.SendPacketTo(packet, neighbor, true)
 		
 		case errStr := <- ip.errorChan:
 			ip.Writer.WriteString("\nERROR: " + errStr)
@@ -148,4 +188,38 @@ func (ip *IpStack) IsThisMyPacket(packet *packet.Packet) bool {
 		}
 	}
 	return false
+}
+
+func (ip *IpStack) GetNextHop(forPacket *packet.Packet) netip.Addr {
+	for prefix, nihop := range ip.ForwardingTable {
+		if prefix.Contains(forPacket.IPHeader.Dst) {
+			return nihop
+		}
+	}
+	panic("should not enter here")
+}
+
+func (ip *IpStack) SendPacketTo(packet *packet.Packet, to *NeighborInfo, forward bool) {
+	var newTTL int = packet.IPHeader.TTL
+	// First decrement the TTL
+	if forward {
+		newTTL := packet.IPHeader.TTL - 1
+		if newTTL < 0 {
+			ip.errorChan <- "TTL reached below 0. Dropping it!"
+			return
+		}
+	}
+	// Recompute Checksum for this packet
+	packet.IPHeader.TTL = newTTL
+	packet.IPHeader.Checksum = 0
+	headerBytes, err := packet.IPHeader.Marshal()
+	if err != nil {
+		ip.errorChan <- err.Error()
+		return
+	}
+	newCheckSum := util.ComputeChecksum(headerBytes)
+	packet.IPHeader.Checksum = int(newCheckSum)
+	// Forward
+	packetBytes := packet.Marshal()
+	to.NeighborConn.WriteTo(packetBytes, to.NeighborConn.RemoteAddr())
 }
