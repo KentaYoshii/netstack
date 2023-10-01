@@ -1,2 +1,6 @@
+github.com/google/btree v1.1.2 h1:xf4v41cLI2Z6FxbKm+8Bu+m8ifhj15JuZ9sa0jZCMUU=
+github.com/google/btree v1.1.2/go.mod h1:qOPhT0dTNdNzV6Z/lhRX0YXUafgPLFUh+gZMl761Gm4=
+github.com/google/netstack v0.0.0-20191123085552-55fcc16cd0eb h1:/YcrD0GSdU5gtckXHVjSEd0Y6VgboNW7VYyImZS3y6g=
+github.com/google/netstack v0.0.0-20191123085552-55fcc16cd0eb/go.mod h1:r/rILWg3r1Qy9G1IFMhsqWLq2GjwuYoTuPgG7ckMAjk=
 github.com/pkg/errors v0.9.1 h1:FEBLx1zS214owpjy7qsBeixbURkuhQAwrK5UwLGTwt4=
 github.com/pkg/errors v0.9.1/go.mod h1:bwawxfHBFNV+L2hUp1rHADufV3IMtnDRdf1r5NINEl0=

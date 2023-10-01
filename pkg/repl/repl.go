@@ -8,8 +8,11 @@ import (
 	"strings"
 )
 
+const (
+	PROMPT = "> "
+)
 
-type ReplHandler = func(args []string)
+type ReplHandler = func(args []string) string
 
 type Repl struct {
 	// Map from Command to Command Handler
@@ -37,11 +40,21 @@ func (r *Repl) RegisterCommandHandler(command string, handler ReplHandler) {
 	r.CommandHandlerMap[command] = handler
 }
 
+// Helper function to write a result
+func (r *Repl) WriteOutput(output string, prompt bool) {
+	r.Writer.WriteString(output)
+	if prompt {
+		r.Writer.WriteString(PROMPT)
+	}
+	r.Writer.Flush()
+}
+
 // Handle Command
 func (r *Repl) StartREPL() {
 	// Register Commands
 	r.RegisterCommandHandler("li", r.handleListInterface)
-
+	r.RegisterCommandHandler("ln", r.handleListNeighbors)
+	
 	fmt.Printf("> ")
 	for r.Scanner.Scan() {
 		// Split
@@ -50,26 +63,21 @@ func (r *Repl) StartREPL() {
 		handler, ok := r.CommandHandlerMap[tokens[0]]
 		if !ok {
 			// No handler
-			r.Writer.WriteString("Command not supported. Type h to see the supported commands\n> ")
-			r.Writer.Flush()
-			
+			r.WriteOutput("Command not supported. Type h to see the supported commands\n", true)
 			continue
 		}
 		// Handle
-		handler(tokens)
-		r.Writer.Flush()
+		r.WriteOutput(handler(tokens), true)
 	}
-
 	if e := r.Scanner.Err(); e != nil {
-		r.Writer.WriteString("Host REPL terminating...\n")
-		r.Writer.Flush()
+		r.WriteOutput("Host REPL terminating...\n", false)
 	}
 }
 
 // ---------- Handler Functions ----------
 
 // Handle "li" command
-func (r *Repl) handleListInterface(args []string) {
+func (r *Repl) handleListInterface(args []string) string {
 	var b strings.Builder
 	b.WriteString(fmt.Sprintf("%-6s %-15s %s\n", "----", "-----------", "-----"))
 	b.WriteString(fmt.Sprintf("%-6s %-15s %s\n", "Name", "Addr/Prefix", "State"))
@@ -85,5 +93,16 @@ func (r *Repl) handleListInterface(args []string) {
 		cidr := fmt.Sprintf("%s/%d", i.VirtualIPAddr, i.Subnet.Bits())
 		b.WriteString(fmt.Sprintf("%-6s %-15s %s\n", i.InterfaceName, cidr, stateString))
 	}
-	r.Writer.WriteString(b.String() + "\n" + "> ")
+	return b.String()
+}
+
+func (r *Repl) handleListNeighbors(args []string) string {
+	var b strings.Builder
+	b.WriteString(fmt.Sprintf("%-6s %-15s %s\n", "-----", "---", "-------"))
+	b.WriteString(fmt.Sprintf("%-6s %-15s %s\n", "Iface", "VIP", "UDPAddr"))
+	b.WriteString(fmt.Sprintf("%-6s %-15s %s\n", "-----", "---", "-------"))
+	for _, nei := range r.HostInfo.Neighbors {
+		b.WriteString(fmt.Sprintf("%-6s %-15s %s\n", nei.InterfaceAt, nei.VirtualIPAddr, nei.MacAddr))
+	}
+	return b.String()
 }
