@@ -19,12 +19,27 @@ type NeighborInfo struct {
 	VirtualIPAddr netip.Addr
 	// MAC of neighbor node
 	MacAddr netip.AddrPort
-	// // UDP conn for communicating with this neighbor
-	// NeighborConn *net.UDPConn
 	// UDP addr
 	NeighborUDPAddr *net.UDPAddr
 	// Interface to talk to this neighbor
 	InterfaceAt string
+}
+
+type HopType int
+
+const (
+	HOP_RIP HopType = iota
+	HOP_LOCAL
+	HOP_STATIC
+)
+
+type NextHop struct {
+	// Address of our next hop
+	NextHopAddr netip.Addr
+	// Cost
+	HopCost int
+	// Type
+	EntryType HopType
 }
 
 type InterfaceInfo struct {
@@ -59,7 +74,7 @@ type IpStack struct {
 	// Map for protocol number to higher layer handler function
 	ProtocolHandlerMap map[uint8]ProtocolHandler
 	// Forwarding Table (map from Network Prefix to NextHop IP)
-	ForwardingTable map[netip.Prefix]netip.Addr
+	ForwardingTable map[netip.Prefix]NextHop
 	// Map from interface name to VIP
 	InterfaceToVIP map[string]netip.Addr
 	// Map from interface name to prefix
@@ -85,7 +100,7 @@ func CreateIPStack() *IpStack {
 		Neighbors:          make(map[netip.Addr]*NeighborInfo),
 		Subnets:            make(map[netip.Prefix]*InterfaceInfo),
 		ProtocolHandlerMap: make(map[uint8]ProtocolHandler),
-		ForwardingTable:    make(map[netip.Prefix]netip.Addr),
+		ForwardingTable:    make(map[netip.Prefix]NextHop),
 		InterfaceToVIP:     make(map[string]netip.Addr),
 		InterfaceToPrefix: make(map[string]netip.Prefix),
 		VIPToUDP: make(map[netip.Addr]netip.AddrPort),
@@ -115,15 +130,9 @@ func (ip *IpStack) Initialize(config *lnxconfig.IPConfig) {
 		if err != nil {
 			panic(err)
 		}
-		
-		// neighborConn, err := net.DialUDP("udp4", nil, neighborUDPAddr)
-		// if err != nil {
-		// 	panic(err)
-		// }
 		ip.Neighbors[n.DestAddr] = &NeighborInfo{
 			VirtualIPAddr:   n.DestAddr,
 			MacAddr:         n.UDPAddr,
-			// NeighborConn:    neighborConn,
 			NeighborUDPAddr: neighborUDPAddr,
 			InterfaceAt:     n.InterfaceName,
 		}
@@ -142,11 +151,14 @@ func (ip *IpStack) Initialize(config *lnxconfig.IPConfig) {
 	// Set up Forwarding table
 	// Static Routes (default gateway)
 	for k, v := range config.StaticRoutes {
-		ip.ForwardingTable[k] = v
+		ip.ForwardingTable[k] = NextHop{
+			NextHopAddr: v,
+			EntryType: HOP_STATIC,
+		}
 	}
 
 	// Setup protocol handlers
-	// TEST
+	// TEST PROTOCOL
 	ip.ProtocolHandlerMap[0] = proto.HandleTestProtocol
 	// TODO: Add RIP, ICMP handlers
 
@@ -198,7 +210,7 @@ func (ip *IpStack) ProcessPackets() {
 				// - Forward
 				// Get next hop
 				nextHop := ip.GetNextHop(packet.IPHeader.Dst)
-				neighbor = ip.Neighbors[nextHop]
+				neighbor = ip.Neighbors[nextHop.NextHopAddr]
 			}
 			// Dispatch the packet
 			ip.SendPacketTo(packet, neighbor, true)
@@ -230,7 +242,7 @@ func (ip *IpStack) IsThisMySubnet(dst netip.Addr) (bool, string) {
 	return false, ""
 }
 
-func (ip *IpStack) GetNextHop(dst netip.Addr) netip.Addr {
+func (ip *IpStack) GetNextHop(dst netip.Addr) NextHop {
 	// Check Forwarding Table
 	for prefix, nihop := range ip.ForwardingTable {
 		if prefix.Contains(dst) {

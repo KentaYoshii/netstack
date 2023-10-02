@@ -21,7 +21,7 @@ type Repl struct {
 	CommandHandlerMap map[string]ReplHandler
 	// Host Info
 	HostInfo *ipstack.IpStack
-	// Writer 
+	// Writer
 	Writer *bufio.Writer
 	// Scanner
 	Scanner *bufio.Scanner
@@ -31,9 +31,9 @@ type Repl struct {
 func CreateREPL(ipstack *ipstack.IpStack) *Repl {
 	return &Repl{
 		CommandHandlerMap: make(map[string]ReplHandler),
-		HostInfo: ipstack,
-		Writer: bufio.NewWriter(os.Stdout),
-		Scanner: bufio.NewScanner(os.Stdin),
+		HostInfo:          ipstack,
+		Writer:            bufio.NewWriter(os.Stdout),
+		Scanner:           bufio.NewScanner(os.Stdin),
 	}
 }
 
@@ -56,6 +56,7 @@ func (r *Repl) StartREPL() {
 	// Register Commands
 	r.RegisterCommandHandler("li", r.handleListInterface)
 	r.RegisterCommandHandler("ln", r.handleListNeighbors)
+	r.RegisterCommandHandler("lr", r.handleListRoutes)
 	r.RegisterCommandHandler("echo", r.handleEcho)
 	r.RegisterCommandHandler("help", r.handleHelp)
 	r.RegisterCommandHandler("send", r.handleSend)
@@ -64,6 +65,10 @@ func (r *Repl) StartREPL() {
 	for r.Scanner.Scan() {
 		// Split
 		tokens := strings.Fields(r.Scanner.Text())
+		if len(tokens) == 0 {
+			r.WriteOutput("", true)
+			continue
+		}
 		if tokens[0] == "exit" {
 			break
 		}
@@ -116,6 +121,32 @@ func (r *Repl) handleListNeighbors(args []string) string {
 	return b.String()
 }
 
+// Handle "lr" command
+func (r *Repl) handleListRoutes(args []string) string {
+	var b strings.Builder
+	b.WriteString(fmt.Sprintf("%-6s %-15s %-10s %s\n", "-", "------", "--------", "----"))
+	b.WriteString(fmt.Sprintf("%-6s %-15s %-10s %s\n", "T", "Prefix", "Next hop", "COST"))
+	b.WriteString(fmt.Sprintf("%-6s %-15s %-10s %s\n", "-", "------", "--------", "----"))
+	// Loop our interfaces first
+	for _, i := range r.HostInfo.Subnets {
+		iName := fmt.Sprintf("LOCAL:%s", i.InterfaceName)
+		b.WriteString(fmt.Sprintf("%-6s %-15s %-10s %s\n", "L", i.Subnet, iName, "0"))
+	}
+	// Loop our routing table next
+	for prefix, ent := range r.HostInfo.ForwardingTable {
+		var cost, t string 
+		if ent.EntryType == ipstack.HOP_STATIC {
+			cost = "-"
+			t = "S"
+		} else {
+			cost = fmt.Sprintf("%d",ent.HopCost)
+			t = "R"
+		}
+		b.WriteString(fmt.Sprintf("%-6s %-15s %-10s %s\n", t, prefix, ent.NextHopAddr.String(), cost))
+	}
+	return b.String()
+}
+
 // Handle "echo" command
 func (r *Repl) handleEcho(args []string) string {
 	var b strings.Builder
@@ -159,13 +190,13 @@ func (r *Repl) handleSend(args []string) string {
 		srcAddr = r.HostInfo.InterfaceToVIP[name]
 	} else {
 		nextHop := r.HostInfo.GetNextHop(destAddr)
-		srcAddr = r.HostInfo.Neighbors[nextHop].VirtualIPAddr
+		srcAddr = r.HostInfo.Neighbors[nextHop.NextHopAddr].VirtualIPAddr
 	}
 	// Get the payload
 	payloadString := strings.Join(args[2:], " ")
+	// Create new packet
 	newPacket := packet.CreateNewPacket([]byte(payloadString), srcAddr, destAddr, 0)
 	r.HostInfo.IpPacketChan <- newPacket
-	// b.WriteString(fmt.Sprintf("src: %s, dst: %s\n", srcAddr.String(), destAddr.String()))
 	b.WriteString(fmt.Sprintf("Sent %d bytes!\n", len(payloadString)))
 	return b.String()
 }
