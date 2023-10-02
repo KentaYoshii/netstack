@@ -9,6 +9,7 @@ import (
 	"netstack/pkg/packet"
 	"netstack/pkg/proto"
 	"netstack/pkg/util"
+	"netstack/pkg/vrouter"
 	"os"
 )
 
@@ -23,23 +24,6 @@ type NeighborInfo struct {
 	NeighborUDPAddr *net.UDPAddr
 	// Interface to talk to this neighbor
 	InterfaceAt string
-}
-
-type HopType int
-
-const (
-	HOP_RIP HopType = iota
-	HOP_LOCAL
-	HOP_STATIC
-)
-
-type NextHop struct {
-	// Address of our next hop
-	NextHopAddr netip.Addr
-	// Cost
-	HopCost int
-	// Type
-	EntryType HopType
 }
 
 type InterfaceInfo struct {
@@ -74,7 +58,7 @@ type IpStack struct {
 	// Map for protocol number to higher layer handler function
 	ProtocolHandlerMap map[uint8]ProtocolHandler
 	// Forwarding Table (map from Network Prefix to NextHop IP)
-	ForwardingTable map[netip.Prefix]NextHop
+	ForwardingTable map[netip.Prefix]*vrouter.NextHop
 	// Map from interface name to VIP
 	InterfaceToVIP map[string]netip.Addr
 	// Map from interface name to prefix
@@ -100,7 +84,7 @@ func CreateIPStack() *IpStack {
 		Neighbors:          make(map[netip.Addr]*NeighborInfo),
 		Subnets:            make(map[netip.Prefix]*InterfaceInfo),
 		ProtocolHandlerMap: make(map[uint8]ProtocolHandler),
-		ForwardingTable:    make(map[netip.Prefix]NextHop),
+		ForwardingTable:    make(map[netip.Prefix]*vrouter.NextHop),
 		InterfaceToVIP:     make(map[string]netip.Addr),
 		InterfaceToPrefix: make(map[string]netip.Prefix),
 		VIPToUDP: make(map[netip.Addr]netip.AddrPort),
@@ -151,9 +135,10 @@ func (ip *IpStack) Initialize(config *lnxconfig.IPConfig) {
 	// Set up Forwarding table
 	// Static Routes (default gateway)
 	for k, v := range config.StaticRoutes {
-		ip.ForwardingTable[k] = NextHop{
+		ip.ForwardingTable[k] = &vrouter.NextHop{
 			NextHopAddr: v,
-			EntryType: HOP_STATIC,
+			EntryType: vrouter.HOP_STATIC,
+			HopCost: 0,
 		}
 	}
 
@@ -242,7 +227,7 @@ func (ip *IpStack) IsThisMySubnet(dst netip.Addr) (bool, string) {
 	return false, ""
 }
 
-func (ip *IpStack) GetNextHop(dst netip.Addr) NextHop {
+func (ip *IpStack) GetNextHop(dst netip.Addr) *vrouter.NextHop {
 	// Check Forwarding Table
 	for prefix, nihop := range ip.ForwardingTable {
 		if prefix.Contains(dst) {

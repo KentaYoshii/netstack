@@ -6,6 +6,7 @@ import (
 	"net/netip"
 	"netstack/pkg/ipstack"
 	"netstack/pkg/packet"
+	"netstack/pkg/vrouter"
 	"os"
 	"strings"
 )
@@ -134,12 +135,12 @@ func (r *Repl) handleListRoutes(args []string) string {
 	}
 	// Loop our routing table next
 	for prefix, ent := range r.HostInfo.ForwardingTable {
-		var cost, t string 
-		if ent.EntryType == ipstack.HOP_STATIC {
+		var cost, t string
+		if ent.EntryType == vrouter.HOP_STATIC {
 			cost = "-"
 			t = "S"
 		} else {
-			cost = fmt.Sprintf("%d",ent.HopCost)
+			cost = fmt.Sprintf("%d", ent.HopCost)
 			t = "R"
 		}
 		b.WriteString(fmt.Sprintf("%-6s %-15s %-10s %s\n", t, prefix, ent.NextHopAddr.String(), cost))
