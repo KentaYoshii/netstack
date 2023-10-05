@@ -7,7 +7,6 @@ import (
 	"netstack/pkg/ipstack"
 	"netstack/pkg/packet"
 	"netstack/pkg/util"
-	"netstack/pkg/vrouter"
 	"os"
 	"strings"
 )
@@ -130,8 +129,12 @@ func (r *Repl) handleListNeighbors(args []string) string {
 	b.WriteString(fmt.Sprintf("%-6s %-15s %s\n", "-----", "---", "-------"))
 	b.WriteString(fmt.Sprintf("%-6s %-15s %s\n", "Iface", "VIP", "UDPAddr"))
 	b.WriteString(fmt.Sprintf("%-6s %-15s %s\n", "-----", "---", "-------"))
-	for _, nei := range r.HostInfo.Neighbors {
-		b.WriteString(fmt.Sprintf("%-6s %-15s %s\n", nei.InterfaceAt, nei.VirtualIPAddr, nei.MacAddr))
+	for k, v := range r.HostInfo.ARPTable {
+		for prefix, subnet := range r.HostInfo.Subnets {
+			if prefix.Contains(k) {
+				b.WriteString(fmt.Sprintf("%-6s %-15s %s\n", subnet.InterfaceName, k, v.MACAddress))
+			}
+		}
 	}
 	return b.String()
 }
@@ -142,22 +145,24 @@ func (r *Repl) handleListRoutes(args []string) string {
 	b.WriteString(fmt.Sprintf("%-6s %-15s %-10s %s\n", "-", "------", "--------", "----"))
 	b.WriteString(fmt.Sprintf("%-6s %-15s %-10s %s\n", "T", "Prefix", "Next hop", "COST"))
 	b.WriteString(fmt.Sprintf("%-6s %-15s %-10s %s\n", "-", "------", "--------", "----"))
-	// Loop our interfaces first
-	for _, i := range r.HostInfo.Subnets {
-		iName := fmt.Sprintf("LOCAL:%s", i.InterfaceName)
-		b.WriteString(fmt.Sprintf("%-6s %-15s %-10s %s\n", "L", i.Subnet, iName, "0"))
-	}
 	// Loop our routing table next
 	for prefix, ent := range r.HostInfo.ForwardingTable {
-		var cost, t string
-		if ent.EntryType == vrouter.HOP_STATIC {
+		var cost, t, name string
+		if ent.EntryType == util.HOP_STATIC {
+			name = ent.NextHopVIPAddr.String()
 			cost = "-"
 			t = "S"
+		} else if ent.EntryType == util.HOP_LOCAL {
+			inf := r.HostInfo.Subnets[prefix]
+			name = "LOCAL:" + inf.InterfaceName
+			cost = "0"
+			t = "L"
 		} else {
+			name = ent.NextHopVIPAddr.String()
 			cost = fmt.Sprintf("%d", ent.HopCost)
 			t = "R"
 		}
-		b.WriteString(fmt.Sprintf("%-6s %-15s %-10s %s\n", t, prefix, ent.NextHopAddr.String(), cost))
+		b.WriteString(fmt.Sprintf("%-6s %-15s %-10s %s\n", t, prefix, name, cost))
 	}
 	return b.String()
 }
@@ -199,20 +204,29 @@ func (r *Repl) handleSend(args []string) string {
 		b.WriteString(err.Error())
 		return b.String()
 	}
-	// Get the outgoing interface vip
-	var srcAddr netip.Addr
-	check, name := r.HostInfo.IsThisMySubnet(destAddr)
-	if check {
-		srcAddr = r.HostInfo.InterfaceToVIP[name]
-	} else {
-		nextHop := r.HostInfo.GetNextHop(destAddr)
-		srcAddr = r.HostInfo.Neighbors[nextHop.NextHopAddr].VirtualIPAddr
-	}
 	// Get the payload
 	payloadString := strings.Join(args[2:], " ")
+	if r.HostInfo.IsThisMyPacket(destAddr) {
+		r.HostInfo.ProtocolHandlerMap[0](&packet.Packet{
+			IPHeader: nil,
+			Payload: []byte(payloadString),
+		})
+		b.WriteString(fmt.Sprintf("Sent %d bytes!\n", len(payloadString)))
+		return b.String()
+	}
+	// Get the outgoing interface vip
+	var srcAddr netip.Addr
+	nextHop, prefix := r.HostInfo.GetNextHop(destAddr)
+	if intf, ok := r.HostInfo.Subnets[prefix]; ok {
+		nextHop.NextHopUDPAddr = r.HostInfo.ARPTable[destAddr].MACAddress
+		srcAddr = intf.VirtualIPAddr
+	} else {
+		neighborEntry := r.HostInfo.ARPTable[nextHop.NextHopVIPAddr]
+		srcAddr = r.HostInfo.Subnets[r.HostInfo.NameToPrefix[neighborEntry.InterfaceName]].VirtualIPAddr
+	}
 	// Create new packet
 	newPacket := packet.CreateNewPacket([]byte(payloadString), srcAddr, destAddr, util.TEST_PROTO)
-	r.HostInfo.IpPacketChan <- newPacket
+	r.HostInfo.SendPacketTo(newPacket, nextHop.NextHopUDPAddr, nextHop.OutgoingConn, false)
 	b.WriteString(fmt.Sprintf("Sent %d bytes!\n", len(payloadString)))
 	return b.String()
 }
