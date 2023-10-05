@@ -6,6 +6,7 @@ import (
 	"net/netip"
 	"netstack/pkg/ipstack"
 	"netstack/pkg/packet"
+	"netstack/pkg/util"
 	"netstack/pkg/vrouter"
 	"os"
 	"strings"
@@ -61,6 +62,7 @@ func (r *Repl) StartREPL() {
 	r.RegisterCommandHandler("echo", r.handleEcho)
 	r.RegisterCommandHandler("help", r.handleHelp)
 	r.RegisterCommandHandler("send", r.handleSend)
+	r.RegisterCommandHandler("info", r.handleInfo)
 
 	fmt.Printf("> ")
 	for r.Scanner.Scan() {
@@ -89,6 +91,18 @@ func (r *Repl) StartREPL() {
 }
 
 // ---------- Handler Functions ----------
+
+// Handle "info" command
+func (r *Repl) handleInfo(args []string) string {
+	var b strings.Builder
+	b.WriteString(fmt.Sprintf("%-6s %-15s %s\n", "----", "---", "---"))
+	b.WriteString(fmt.Sprintf("%-6s %-15s %s\n", "INTF", "VIP", "UDP"))
+	b.WriteString(fmt.Sprintf("%-6s %-15s %s\n", "----", "---", "---"))
+	for _, i := range r.HostInfo.Subnets {
+		b.WriteString(fmt.Sprintf("%-6s %-15s %s\n", i.InterfaceName, i.VirtualIPAddr.String(), i.MacAddr.String()))
+	}
+	return b.String()
+}
 
 // Handle "li" command
 func (r *Repl) handleListInterface(args []string) string {
@@ -162,6 +176,7 @@ func (r *Repl) handleHelp(args []string) string {
 	b.WriteString(fmt.Sprintf("%-6s %-15s\n", "Command", "Description"))
 	b.WriteString(fmt.Sprintf("%-6s %-15s\n", "-------", "-----------"))
 	b.WriteString(fmt.Sprintf("%-6s %-15s\n", "echo", "Command Test"))
+	b.WriteString(fmt.Sprintf("%-6s %-15s\n", "info", "About me"))
 	b.WriteString(fmt.Sprintf("%-6s %-15s\n", "exit", "Terminate this program"))
 	b.WriteString(fmt.Sprintf("%-6s %-15s\n", "li", "List interfaces"))
 	b.WriteString(fmt.Sprintf("%-6s %-15s\n", "lr", "List routes"))
@@ -175,7 +190,7 @@ func (r *Repl) handleHelp(args []string) string {
 // Handle "send" command
 func (r *Repl) handleSend(args []string) string {
 	var b strings.Builder
-	if len(args) != 3 {
+	if len(args) < 3 {
 		b.WriteString("Usage:  send <dest ip> <message>\n")
 		return b.String()
 	}
@@ -196,7 +211,7 @@ func (r *Repl) handleSend(args []string) string {
 	// Get the payload
 	payloadString := strings.Join(args[2:], " ")
 	// Create new packet
-	newPacket := packet.CreateNewPacket([]byte(payloadString), srcAddr, destAddr, 0)
+	newPacket := packet.CreateNewPacket([]byte(payloadString), srcAddr, destAddr, util.TEST_PROTO)
 	r.HostInfo.IpPacketChan <- newPacket
 	b.WriteString(fmt.Sprintf("Sent %d bytes!\n", len(payloadString)))
 	return b.String()

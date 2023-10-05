@@ -3,6 +3,7 @@ package packet
 import (
 	"net/netip"
 	"netstack/pkg/util"
+	"bytes"
 )
 
 type Packet struct {
@@ -14,11 +15,22 @@ type Packet struct {
 
 // Marshal the packet struct
 func (p *Packet) Marshal() []byte {
-	totalBytes := make([]byte, util.MAX_PACKET_SIZE)
+	buf := new(bytes.Buffer)
 	headerBytes, _ := p.IPHeader.Marshal()
-	b := copy(totalBytes, headerBytes)
-	copy(totalBytes[b:], p.Payload)
-	return totalBytes
+	buf.Write(headerBytes)
+	buf.Write(p.Payload)
+	return buf.Bytes()
+}
+
+// Compute Checksum for a given packet
+func SetCheckSumFor(packet *Packet) error {
+	hBytes, err := packet.IPHeader.Marshal()
+	if err != nil {
+		return err
+	}
+	newCheckSum := util.ComputeChecksum(hBytes)
+	packet.IPHeader.Checksum = int(newCheckSum)
+	return nil
 }
 
 // Create a new IP packet with the info passed in 

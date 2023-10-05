@@ -1,5 +1,9 @@
 package util
 
 const (
+	INITIAL_SETUP_TO = 500
 	MAX_PACKET_SIZE = 1400
+	TEST_PROTO = 0
+	ICMP_PROTO = 1
+	RIP_PROTO = 200
 )

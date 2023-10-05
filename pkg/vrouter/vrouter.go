@@ -5,6 +5,8 @@ import (
 	"encoding/binary"
 	"net"
 	"net/netip"
+	"netstack/pkg/packet"
+	"netstack/pkg/util"
 )
 
 type HopType int
@@ -24,6 +26,15 @@ type NextHop struct {
 	EntryType HopType
 }
 
+type NeighborRouterInfo struct {
+	// Outgoing VIP
+	OutgoingVIP netip.Addr
+	// Outgoing Interface
+	OutgoingConn *net.UDPConn
+	// Neighbor Router UDP Addr
+	RouterUDPAddr *net.UDPAddr
+}
+
 type RIPMessageEntry struct {
 	// Network Address
 	NetworkAddr uint32
@@ -39,6 +50,49 @@ type RIPMessage struct {
 	// 0 for Request
 	NumEntries uint16
 	Entries    []*RIPMessageEntry
+}
+
+func RequestRoutingInfo(ripTo map[netip.Addr]*NeighborRouterInfo) error {
+	newRequestMessage := RIPMessage{
+		Command:    1,
+		NumEntries: 0,
+	}
+	buf := new(bytes.Buffer)
+	err := binary.Write(buf, binary.BigEndian, newRequestMessage.Command)
+	if err != nil {
+		return err
+	}
+	err = binary.Write(buf, binary.BigEndian, newRequestMessage.NumEntries)
+	if err != nil {
+		return err
+	}
+	bytes := buf.Bytes()
+	for dst, neighbor := range ripTo {
+		newPacket := packet.CreateNewPacket(bytes, neighbor.OutgoingVIP, dst, util.RIP_PROTO)
+		packet.SetCheckSumFor(newPacket)
+		_, err := neighbor.OutgoingConn.WriteToUDP(newPacket.Marshal(), neighbor.RouterUDPAddr)
+		if err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// Entry function for rip protocol
+func SendOutRIPMessages(ripTo map[netip.Addr]NeighborRouterInfo,
+	ft map[netip.Prefix]*NextHop, mySubnets []netip.Prefix) error {
+	// First get the entries we are announcing
+	ripEntries, err := GetRIPEntriesFromTable(ft, mySubnets)
+	if err != nil {
+		return err
+	}
+	bytes, err := MarshalRIPEntries(ripEntries)
+	// Send out
+	for dst, neighbor := range ripTo {
+		packet := packet.CreateNewPacket(bytes, neighbor.OutgoingVIP, dst, util.RIP_PROTO)
+		neighbor.OutgoingConn.WriteToUDP(packet.Marshal(), neighbor.RouterUDPAddr)
+	}
+	return nil
 }
 
 // Recover RIPEntries from bytes
@@ -82,8 +136,32 @@ func MarshalRIPEntries(entries []*RIPMessageEntry) ([]byte, error) {
 }
 
 // Given my forwarding table, return all the RIP entries that can be potentially sent
-func GetRIPEntriesFromTable(ft map[netip.Prefix]*NextHop) ([]*RIPMessageEntry, error) {
+func GetRIPEntriesFromTable(ft map[netip.Prefix]*NextHop, mySubnets []netip.Prefix) ([]*RIPMessageEntry, error) {
 	entries := make([]*RIPMessageEntry, 0)
+	// Add my subnets (these are in "up" state)
+	for _, subnet := range mySubnets {
+		// IPv4 in BigEndian
+		networkAddr := binary.BigEndian.Uint32(subnet.Addr().AsSlice())
+		// Get mask
+		prefixString := subnet.String()
+		_, ipnet, err := net.ParseCIDR(prefixString)
+		if err != nil {
+			return nil, err
+		}
+		mask := ipnet.Mask
+		buf := bytes.NewReader(mask)
+		var maskInt uint32
+		err = binary.Read(buf, binary.BigEndian, &maskInt)
+		if err != nil {
+			return nil, err
+		}
+		entries = append(entries, &RIPMessageEntry{
+			NetworkAddr: networkAddr,
+			Mask:        maskInt,
+			Cost:        0,
+		})
+	}
+	// Add the forwarding table entries
 	for prefix, ent := range ft {
 		// IPv4 in BigEndian
 		networkAddr := binary.BigEndian.Uint32(prefix.Addr().AsSlice())

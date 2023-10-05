@@ -11,6 +11,7 @@ import (
 	"netstack/pkg/util"
 	"netstack/pkg/vrouter"
 	"os"
+	"time"
 )
 
 type ProtocolHandler func(*packet.Packet)
@@ -63,17 +64,19 @@ type IpStack struct {
 	InterfaceToVIP map[string]netip.Addr
 	// Map from interface name to prefix
 	InterfaceToPrefix map[string]netip.Prefix
-	// Map from VIP to UDP
-	VIPToUDP map[netip.Addr]netip.AddrPort
+
 	// Channels
 
 	// Channel through whicn interfaces send IP packets to network layer
 	IpPacketChan chan *packet.Packet
 	// Channel for getting non-serious error messages
 	errorChan chan string
+	// Debugging
+	InfoChan chan string
 
 	// ----- ROUTERS specific -----
-	RIPTo []netip.Addr
+	// Map from neighbor router ip address udp conn
+	RIPTo map[netip.Addr]*vrouter.NeighborRouterInfo
 }
 
 // Create new IP stack
@@ -86,10 +89,10 @@ func CreateIPStack() *IpStack {
 		ProtocolHandlerMap: make(map[uint8]ProtocolHandler),
 		ForwardingTable:    make(map[netip.Prefix]*vrouter.NextHop),
 		InterfaceToVIP:     make(map[string]netip.Addr),
-		InterfaceToPrefix: make(map[string]netip.Prefix),
-		VIPToUDP: make(map[netip.Addr]netip.AddrPort),
+		InterfaceToPrefix:  make(map[string]netip.Prefix),
 		IpPacketChan:       make(chan *packet.Packet, 100),
 		errorChan:          make(chan string, 100),
+		InfoChan:           make(chan string, 100),
 	}
 }
 
@@ -99,7 +102,6 @@ func (ip *IpStack) Initialize(config *lnxconfig.IPConfig) {
 	for _, i := range config.Interfaces {
 		ip.InterfaceToPrefix[i.Name] = i.AssignedPrefix
 		ip.InterfaceToVIP[i.Name] = i.AssignedIP
-		ip.VIPToUDP[i.AssignedIP] = i.UDPAddr
 		ip.Subnets[i.AssignedPrefix] = &InterfaceInfo{
 			VirtualIPAddr: i.AssignedIP,
 			MacAddr:       i.UDPAddr,
@@ -108,6 +110,10 @@ func (ip *IpStack) Initialize(config *lnxconfig.IPConfig) {
 			IsUp:          true,
 		}
 	}
+	// Initialize the interfaces and start listening
+	ip.InitializeInterfaces()
+	// Let the port binding complete
+	time.Sleep(time.Millisecond * util.INITIAL_SETUP_TO)
 	// Load in the Neighbors Information
 	for _, n := range config.Neighbors {
 		neighborUDPAddr, err := net.ResolveUDPAddr("udp4", n.UDPAddr.String())
@@ -129,7 +135,18 @@ func (ip *IpStack) Initialize(config *lnxconfig.IPConfig) {
 	}
 	// (ROUTER): set neighbors
 	if ip.RipEnabled {
-		ip.RIPTo = config.RipNeighbors
+		ip.RIPTo = make(map[netip.Addr]*vrouter.NeighborRouterInfo)
+		for _, neighbor := range config.RipNeighbors {
+			outgoingInterface := ip.Neighbors[neighbor].InterfaceAt
+			outgoingInterfacePrefix := ip.InterfaceToPrefix[outgoingInterface]
+			intf := ip.Subnets[outgoingInterfacePrefix]
+
+			ip.RIPTo[neighbor] = &vrouter.NeighborRouterInfo{
+				OutgoingVIP:   intf.VirtualIPAddr,
+				OutgoingConn:  intf.ListenConn,
+				RouterUDPAddr: ip.Neighbors[neighbor].NeighborUDPAddr,
+			}
+		}
 	}
 
 	// Set up Forwarding table
@@ -137,20 +154,30 @@ func (ip *IpStack) Initialize(config *lnxconfig.IPConfig) {
 	for k, v := range config.StaticRoutes {
 		ip.ForwardingTable[k] = &vrouter.NextHop{
 			NextHopAddr: v,
-			EntryType: vrouter.HOP_STATIC,
-			HopCost: 0,
+			EntryType:   vrouter.HOP_STATIC,
+			HopCost:     0,
 		}
 	}
 
 	// Setup protocol handlers
 	// TEST PROTOCOL
-	ip.ProtocolHandlerMap[0] = proto.HandleTestProtocol
-	// TODO: Add RIP, ICMP handlers
+	ip.ProtocolHandlerMap[util.TEST_PROTO] = proto.HandleTestProtocol
+	// RIP PROTOCOL
+	if ip.RipEnabled {
+		ip.ProtocolHandlerMap[util.RIP_PROTO] = proto.HandleRIPProtocol
+	}
+	// ICMP PROTOCOL
+	ip.ProtocolHandlerMap[util.ICMP_PROTO] = proto.HandleICMProtocol
 
-	// Initialize the interfaces and start listening
-	ip.InitializeInterfaces()
 	// Start processing incoming packets
 	go ip.ProcessPackets()
+
+	// Request routing information
+	if ip.RipEnabled {
+		if err := vrouter.RequestRoutingInfo(ip.RIPTo); err != nil {
+			ip.errorChan <- err.Error()
+		}
+	}
 }
 
 // Register a handler
@@ -203,6 +230,9 @@ func (ip *IpStack) ProcessPackets() {
 		case errStr := <-ip.errorChan:
 			ip.Writer.WriteString("\nERROR: " + errStr)
 			ip.Writer.Flush()
+		case info := <-ip.InfoChan:
+			ip.Writer.WriteString("\nInfo: " + info)
+			ip.Writer.Flush()
 		}
 	}
 }
@@ -243,7 +273,7 @@ func (ip *IpStack) SendPacketTo(packet *packet.Packet, to *NeighborInfo, forward
 	if forward {
 		newTTL := packet.IPHeader.TTL - 1
 		if newTTL < 0 {
-			ip.errorChan <- "TTL reached below 0. Dropping it!"
+			ip.errorChan <- "TTL reached below 0. Dropping it!\n"
 			return
 		}
 	}
