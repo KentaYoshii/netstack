@@ -22,10 +22,12 @@ const (
 	HOP_STATIC
 )
 
+// Given an int, convert to a binary string
 func FromIntToBitString(v uint8) string {
 	return fmt.Sprintf("%08b", v)
 }
 
+// Given an netip.Addr, convert to a 32 bytes string
 func IPAddrToBitStrting(addr netip.Addr) string {
 	var b strings.Builder
 	ipBytes := addr.As4()
@@ -35,6 +37,7 @@ func IPAddrToBitStrting(addr netip.Addr) string {
 	return b.String()
 }
 
+// Given two netip.Addrs, return the number of shared prefix between down time
 func GetNumSharedPrefix(a1 netip.Addr, a2 netip.Addr) int {
 	cnt := 0
 	a1Str := IPAddrToBitStrting(a1)

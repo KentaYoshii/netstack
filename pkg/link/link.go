@@ -8,10 +8,10 @@ import (
 
 // Function that keeps reading from an interface for IP packets
 // For each packet
-// - ...
+// - Parse the header, check TTL and checksum, and, if everything looks good, send to ipstack
 // At any point during the processing of incoming packet, an error occurred,
 // simply drop the packet
-func ListenAtInterface(conn *net.UDPConn, packetChan chan *packet.Packet, errorChan chan string) { 
+func ListenAtInterface(conn *net.UDPConn, packetChan chan *packet.Packet, errorChan chan string) {
 	for {
 		buf := make([]byte, util.MAX_PACKET_SIZE)
 		_, _, err := conn.ReadFromUDP(buf)
@@ -22,6 +22,10 @@ func ListenAtInterface(conn *net.UDPConn, packetChan chan *packet.Packet, errorC
 		header, err := util.ParseHeader(buf)
 		if err != nil {
 			errorChan <- err.Error()
+			continue
+		}
+		if header.TTL < 0 {
+			errorChan <- "TTL is invalid! Dropping this packet!\n"
 			continue
 		}
 		headerBytes := buf[:header.Len]
@@ -35,7 +39,7 @@ func ListenAtInterface(conn *net.UDPConn, packetChan chan *packet.Packet, errorC
 		// Checksum ok so send the packet to the channel
 		packetChan <- &packet.Packet{
 			IPHeader: header,
-			Payload: buf[header.Len:],
+			Payload:  buf[header.Len:],
 		}
 	}
 }

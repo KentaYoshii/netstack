@@ -216,18 +216,19 @@ func (ip *IpStack) InitializeInterfaces() {
 func (ip *IpStack) ProcessPackets() {
 	for {
 		select {
+			// Packets sent from the Link Layer
 		case packet := <-ip.IpPacketChan:
 			if ip.IsThisMyPacket(packet.IPHeader.Dst) {
-				// Dst == one of our interfaces
-				// - Invoke the handler
+				// Packet is for me
 				ip.ProtocolHandlerMap[uint8(packet.IPHeader.Protocol)](packet)
 				continue
 			}
+			// Get the next hop
 			nextHop, prefix := ip.GetNextHop(packet.IPHeader.Dst)
 			nextUdpAddr := nextHop.NextHopUDPAddr
 			nextUdpConn := ip.Subnets[ip.NameToPrefix[nextHop.InterfaceName]].ListenConn
 			if _, ok := ip.Subnets[prefix]; ok {
-				// If one of my subnets
+				// If one of my subnets, local delivery
 				nextUdpAddr = ip.Subnets[prefix].ARPTable[packet.IPHeader.Dst]
 			}
 			ip.SendPacketTo(packet, nextUdpAddr, nextUdpConn, true)
@@ -252,15 +253,8 @@ func (ip *IpStack) IsThisMyPacket(dst netip.Addr) bool {
 	return false
 }
 
-func (ip *IpStack) IsThisMySubnet(dst netip.Addr) (bool, string) {
-	for prefix, i := range ip.Subnets {
-		if prefix.Contains(dst) {
-			return true, i.InterfaceName
-		}
-	}
-	return false, ""
-}
-
+// Given a destination IP Address, consult the forwarding table to get next hop
+// Performs a Longest Prefix Matching
 func (ip *IpStack) GetNextHop(dst netip.Addr) (NextHop, netip.Prefix) {
 	// Check Forwarding Table
 	longest := -1
@@ -279,10 +273,11 @@ func (ip *IpStack) GetNextHop(dst netip.Addr) (NextHop, netip.Prefix) {
 	return niHop, rprefix
 }
 
+// Send a packet to "udpAddr"
 func (ip *IpStack) SendPacketTo(packet *packet.Packet, udpAddr netip.AddrPort, udpConn *net.UDPConn, forward bool) {
 	var newTTL int = packet.IPHeader.TTL
-	// First decrement the TTL
 	if forward {
+		// If forwarding, decrement the TTL
 		newTTL := packet.IPHeader.TTL - 1
 		if newTTL < 0 {
 			ip.errorChan <- "TTL reached below 0. Dropping it!\n"
