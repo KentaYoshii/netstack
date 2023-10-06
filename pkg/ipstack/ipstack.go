@@ -23,8 +23,8 @@ type NextHop struct {
 	HopCost uint32
 	// Type
 	EntryType util.HopType
-	// UDP Conn
-	OutgoingConn *net.UDPConn
+	// Interface name
+	InterfaceName string
 }
 
 type ProtocolHandler func(*packet.Packet)
@@ -42,11 +42,8 @@ type InterfaceInfo struct {
 	Subnet netip.Prefix
 	// State (up/down)
 	IsUp bool
-}
-
-type ARPTableEntry struct {
-	InterfaceName string
-	MACAddress    netip.AddrPort
+	// ARP Table
+	ARPTable map[netip.Addr]netip.AddrPort
 }
 
 type IpStack struct {
@@ -65,8 +62,6 @@ type IpStack struct {
 	ProtocolHandlerMap map[uint8]ProtocolHandler
 	// Forwarding Table (map from Network Prefix to NextHop IP)
 	ForwardingTable map[netip.Prefix]*NextHop
-	// ARP Table
-	ARPTable map[netip.Addr]ARPTableEntry
 	// Interface name to Prefix Address
 	NameToPrefix map[string]netip.Prefix
 
@@ -92,7 +87,6 @@ func CreateIPStack() *IpStack {
 		Subnets:            make(map[netip.Prefix]*InterfaceInfo),
 		ProtocolHandlerMap: make(map[uint8]ProtocolHandler),
 		ForwardingTable:    make(map[netip.Prefix]*NextHop),
-		ARPTable:           make(map[netip.Addr]ARPTableEntry),
 		NameToPrefix:       make(map[string]netip.Prefix),
 		IpPacketChan:       make(chan *packet.Packet, 100),
 		errorChan:          make(chan string, 100),
@@ -111,13 +105,15 @@ func (ip *IpStack) Initialize(config *lnxconfig.IPConfig) {
 			InterfaceName: i.Name,
 			Subnet:        i.AssignedPrefix,
 			IsUp:          true,
+			ARPTable:      make(map[netip.Addr]netip.AddrPort, 0),
 		}
 	}
 	// =============== ARP Table ===============
 	for _, n := range config.Neighbors {
-		ip.ARPTable[n.DestAddr] = ARPTableEntry{
-			InterfaceName: n.InterfaceName,
-			MACAddress:    n.UDPAddr,
+		for prefix, intf := range ip.Subnets {
+			if prefix.Contains(n.DestAddr) {
+				intf.ARPTable[n.DestAddr] = n.UDPAddr
+			}
 		}
 	}
 
@@ -142,7 +138,7 @@ func (ip *IpStack) Initialize(config *lnxconfig.IPConfig) {
 				ip.RIPTo[neighbor] = &vrouter.NeighborRouterInfo{
 					OutgoingVIP:   subnet.VirtualIPAddr,
 					OutgoingConn:  subnet.ListenConn,
-					RouterUDPAddr: ip.ARPTable[neighbor].MACAddress,
+					RouterUDPAddr: subnet.ARPTable[neighbor],
 				}
 			}
 		}
@@ -150,14 +146,17 @@ func (ip *IpStack) Initialize(config *lnxconfig.IPConfig) {
 	// ============ Forwarding Table ============
 	// Static Routes (default gateway)
 	for k, v := range config.StaticRoutes {
-		intfName := ip.ARPTable[v].InterfaceName
-		subnet := ip.Subnets[ip.NameToPrefix[intfName]]
-		ip.ForwardingTable[k] = &NextHop{
-			NextHopVIPAddr: v,
-			NextHopUDPAddr: ip.ARPTable[v].MACAddress,
-			EntryType:      util.HOP_STATIC,
-			HopCost:        0,
-			OutgoingConn:   subnet.ListenConn,
+		for prefix, intf := range ip.Subnets {
+			if !prefix.Contains(v) {
+				continue
+			}
+			ip.ForwardingTable[k] = &NextHop{
+				NextHopVIPAddr: v,
+				NextHopUDPAddr: intf.ARPTable[v],
+				EntryType:      util.HOP_STATIC,
+				HopCost:        0,
+				InterfaceName:  intf.InterfaceName,
+			}
 		}
 	}
 	// Local Interfaces
@@ -167,7 +166,7 @@ func (ip *IpStack) Initialize(config *lnxconfig.IPConfig) {
 			NextHopUDPAddr: v.MacAddr,
 			EntryType:      util.HOP_LOCAL,
 			HopCost:        0,
-			OutgoingConn:   v.ListenConn,
+			InterfaceName:  v.InterfaceName,
 		}
 	}
 
@@ -226,10 +225,10 @@ func (ip *IpStack) ProcessPackets() {
 			}
 			nextHop, prefix := ip.GetNextHop(packet.IPHeader.Dst)
 			nextUdpAddr := nextHop.NextHopUDPAddr
-			nextUdpConn := nextHop.OutgoingConn
+			nextUdpConn := ip.Subnets[ip.NameToPrefix[nextHop.InterfaceName]].ListenConn
 			if _, ok := ip.Subnets[prefix]; ok {
 				// If one of my subnets
-				nextUdpAddr = ip.ARPTable[packet.IPHeader.Dst].MACAddress
+				nextUdpAddr = ip.Subnets[prefix].ARPTable[packet.IPHeader.Dst]
 			}
 			ip.SendPacketTo(packet, nextUdpAddr, nextUdpConn, true)
 		case errStr := <-ip.errorChan:

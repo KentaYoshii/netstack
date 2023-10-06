@@ -129,11 +129,9 @@ func (r *Repl) handleListNeighbors(args []string) string {
 	b.WriteString(fmt.Sprintf("%-6s %-15s %s\n", "-----", "---", "-------"))
 	b.WriteString(fmt.Sprintf("%-6s %-15s %s\n", "Iface", "VIP", "UDPAddr"))
 	b.WriteString(fmt.Sprintf("%-6s %-15s %s\n", "-----", "---", "-------"))
-	for k, v := range r.HostInfo.ARPTable {
-		for prefix, subnet := range r.HostInfo.Subnets {
-			if prefix.Contains(k) {
-				b.WriteString(fmt.Sprintf("%-6s %-15s %s\n", subnet.InterfaceName, k, v.MACAddress))
-			}
+	for _, subnet := range r.HostInfo.Subnets {
+		for k, v := range subnet.ARPTable {
+			b.WriteString(fmt.Sprintf("%-6s %-15s %s\n", subnet.InterfaceName, k, v))
 		}
 	}
 	return b.String()
@@ -218,15 +216,16 @@ func (r *Repl) handleSend(args []string) string {
 	var srcAddr netip.Addr
 	nextHop, prefix := r.HostInfo.GetNextHop(destAddr)
 	if intf, ok := r.HostInfo.Subnets[prefix]; ok {
-		nextHop.NextHopUDPAddr = r.HostInfo.ARPTable[destAddr].MACAddress
+		nextHop.NextHopUDPAddr = intf.ARPTable[destAddr]
 		srcAddr = intf.VirtualIPAddr
 	} else {
-		neighborEntry := r.HostInfo.ARPTable[nextHop.NextHopVIPAddr]
-		srcAddr = r.HostInfo.Subnets[r.HostInfo.NameToPrefix[neighborEntry.InterfaceName]].VirtualIPAddr
+		// Check where next hop is
+		srcAddr = r.HostInfo.Subnets[r.HostInfo.NameToPrefix[nextHop.InterfaceName]].VirtualIPAddr
 	}
 	// Create new packet
 	newPacket := packet.CreateNewPacket([]byte(payloadString), srcAddr, destAddr, util.TEST_PROTO)
-	r.HostInfo.SendPacketTo(newPacket, nextHop.NextHopUDPAddr, nextHop.OutgoingConn, false)
+	outConn := r.HostInfo.Subnets[r.HostInfo.NameToPrefix[nextHop.InterfaceName]].ListenConn
+	r.HostInfo.SendPacketTo(newPacket, nextHop.NextHopUDPAddr, outConn, false)
 	b.WriteString(fmt.Sprintf("Sent %d bytes!\n", len(payloadString)))
 	return b.String()
 }
