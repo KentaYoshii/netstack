@@ -62,6 +62,8 @@ func (r *Repl) StartREPL() {
 	r.RegisterCommandHandler("help", r.handleHelp)
 	r.RegisterCommandHandler("send", r.handleSend)
 	r.RegisterCommandHandler("info", r.handleInfo)
+	r.RegisterCommandHandler("up", r.handleUp)
+	r.RegisterCommandHandler("down", r.handleDown)
 
 	fmt.Printf("> ")
 	for r.Scanner.Scan() {
@@ -98,7 +100,7 @@ func (r *Repl) handleInfo(args []string) string {
 	b.WriteString(fmt.Sprintf("%-6s %-15s %s\n", "INTF", "VIP", "UDP"))
 	b.WriteString(fmt.Sprintf("%-6s %-15s %s\n", "----", "---", "---"))
 	for _, i := range r.HostInfo.Subnets {
-		b.WriteString(fmt.Sprintf("%-6s %-15s %s\n", i.InterfaceName, i.VirtualIPAddr.String(), i.MacAddr.String()))
+		b.WriteString(fmt.Sprintf("%-6s %-15s %s\n", i.InterfaceName, i.IPAddr.String(), i.ListenAddr.String()))
 	}
 	return b.String()
 }
@@ -117,7 +119,7 @@ func (r *Repl) handleListInterface(args []string) string {
 		} else {
 			stateString = "down"
 		}
-		cidr := fmt.Sprintf("%s/%d", i.VirtualIPAddr, i.Subnet.Bits())
+		cidr := fmt.Sprintf("%s/%d", i.IPAddr, i.Subnet.Bits())
 		b.WriteString(fmt.Sprintf("%-6s %-15s %s\n", i.InterfaceName, cidr, stateString))
 	}
 	return b.String()
@@ -205,27 +207,77 @@ func (r *Repl) handleSend(args []string) string {
 	// Get the payload
 	payloadString := strings.Join(args[2:], " ")
 	if r.HostInfo.IsThisMyPacket(destAddr) {
-		r.HostInfo.ProtocolHandlerMap[0](&packet.Packet{
-			IPHeader: nil,
-			Payload: []byte(payloadString),
-		})
+		r.HostInfo.ProtocolHandlerMap[0](packet.CreateNewPacket([]byte(payloadString), netip.Addr{}, destAddr, util.TEST_PROTO))
 		b.WriteString(fmt.Sprintf("Sent %d bytes!\n", len(payloadString)))
 		return b.String()
 	}
-	// Get the outgoing interface vip
-	var srcAddr netip.Addr
-	nextHop, prefix := r.HostInfo.GetNextHop(destAddr)
-	if intf, ok := r.HostInfo.Subnets[prefix]; ok {
-		nextHop.NextHopUDPAddr = intf.ARPTable[destAddr]
-		srcAddr = intf.VirtualIPAddr
-	} else {
-		// Check where next hop is
-		srcAddr = r.HostInfo.Subnets[r.HostInfo.NameToPrefix[nextHop.InterfaceName]].VirtualIPAddr
+
+	nextHop, found := r.HostInfo.GetNextHop(destAddr)
+	if !found {
+		b.WriteString("Next Hop not found!\n")
+		return b.String()
 	}
-	// Create new packet
-	newPacket := packet.CreateNewPacket([]byte(payloadString), srcAddr, destAddr, util.TEST_PROTO)
-	outConn := r.HostInfo.Subnets[r.HostInfo.NameToPrefix[nextHop.InterfaceName]].ListenConn
-	r.HostInfo.SendPacketTo(newPacket, nextHop.NextHopUDPAddr, outConn, false)
+	// Get the link to send out from
+	link := r.HostInfo.Subnets[r.HostInfo.NameToPrefix[nextHop.InterfaceName]]
+	newPacket := packet.CreateNewPacket([]byte(payloadString), link.IPAddr, destAddr, util.TEST_PROTO)
+
+	if nextHop.EntryType == util.HOP_LOCAL {
+		// LOCAL delivery
+		err = link.SendLocal(newPacket, destAddr, false)
+	} else {
+		// FORWARD
+		err = link.SendLocal(newPacket, nextHop.NextHopVIPAddr, false)
+	}
+	if err != nil {
+		b.WriteString(err.Error())
+		return b.String()
+	}
 	b.WriteString(fmt.Sprintf("Sent %d bytes!\n", len(payloadString)))
+	return b.String()
+}
+
+// Handle "up" command
+func (r *Repl) handleUp(args []string) string {
+	var b strings.Builder
+	if len(args) != 2 {
+		b.WriteString("Usage:  up <if name>\n")
+		return b.String()
+	}
+	target := args[1]
+	for _, li := range r.HostInfo.Subnets {
+		if li.InterfaceName == target {
+			if li.IsUp {
+				// no op
+				b.WriteString("Interface is already up\n")
+				return b.String()
+			}
+			li.IsUp = true
+			return b.String()
+		}
+	}
+	b.WriteString(target + " not found\n")
+	return b.String()
+}
+
+// Handle "down" command
+func (r *Repl) handleDown(args []string) string {
+	var b strings.Builder
+	if len(args) != 2 {
+		b.WriteString("Usage:  down <if name>\n")
+		return b.String()
+	}
+	target := args[1]
+	for _, li := range r.HostInfo.Subnets {
+		if li.InterfaceName == target {
+			if !li.IsUp {
+				// no op
+				b.WriteString("Interface is already down\n")
+				return b.String()
+			}
+			li.IsUp = false
+			return b.String()
+		}
+	}
+	b.WriteString(target + " not found\n")
 	return b.String()
 }

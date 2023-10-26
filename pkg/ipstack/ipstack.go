@@ -2,7 +2,6 @@ package ipstack
 
 import (
 	"bufio"
-	"net"
 	"net/netip"
 	"netstack/pkg/link"
 	"netstack/pkg/lnxconfig"
@@ -15,8 +14,6 @@ import (
 )
 
 type NextHop struct {
-	// UDPAddress of our next hop
-	NextHopUDPAddr netip.AddrPort
 	// VIPAddress of our next hop
 	NextHopVIPAddr netip.Addr
 	// Cost (infinity = 16)
@@ -29,23 +26,6 @@ type NextHop struct {
 
 type ProtocolHandler func(*packet.Packet)
 
-type InterfaceInfo struct {
-	// VIP of the interface
-	VirtualIPAddr netip.Addr
-	// MAC of this interface
-	MacAddr netip.AddrPort
-	// Listening Conn of this interface
-	ListenConn *net.UDPConn
-	// Name of the interface
-	InterfaceName string
-	// Subnet
-	Subnet netip.Prefix
-	// State (up/down)
-	IsUp bool
-	// ARP Table
-	ARPTable map[netip.Addr]netip.AddrPort
-}
-
 type IpStack struct {
 
 	// Writer
@@ -57,7 +37,7 @@ type IpStack struct {
 	// Maps
 
 	// Map from Subnet IP address to InterfaceInfo Struct
-	Subnets map[netip.Prefix]*InterfaceInfo
+	Subnets map[netip.Prefix]*link.Link
 	// Map for protocol number to higher layer handler function
 	ProtocolHandlerMap map[uint8]ProtocolHandler
 	// Forwarding Table (map from Network Prefix to NextHop IP)
@@ -84,7 +64,7 @@ func CreateIPStack() *IpStack {
 	return &IpStack{
 		Writer:             bufio.NewWriter(os.Stdout),
 		RipEnabled:         false,
-		Subnets:            make(map[netip.Prefix]*InterfaceInfo),
+		Subnets:            make(map[netip.Prefix]*link.Link),
 		ProtocolHandlerMap: make(map[uint8]ProtocolHandler),
 		ForwardingTable:    make(map[netip.Prefix]*NextHop),
 		NameToPrefix:       make(map[string]netip.Prefix),
@@ -94,18 +74,18 @@ func CreateIPStack() *IpStack {
 	}
 }
 
-// Given "config", initialize the ip struct
+// Given "config", initialize the ip struct and link structs
 func (ip *IpStack) Initialize(config *lnxconfig.IPConfig) {
 	// ============== Interface ==============
 	for _, i := range config.Interfaces {
 		ip.NameToPrefix[i.Name] = i.AssignedPrefix
-		ip.Subnets[i.AssignedPrefix] = &InterfaceInfo{
-			VirtualIPAddr: i.AssignedIP,
-			MacAddr:       i.UDPAddr,
-			InterfaceName: i.Name,
-			Subnet:        i.AssignedPrefix,
-			IsUp:          true,
+		ip.Subnets[i.AssignedPrefix] = &link.Link{
+			IPAddr:        i.AssignedIP,
+			ListenAddr:    i.UDPAddr,
 			ARPTable:      make(map[netip.Addr]netip.AddrPort, 0),
+			InterfaceName: i.Name,
+			IsUp:          true,
+			Subnet:        i.AssignedPrefix,
 		}
 	}
 	// =============== ARP Table ===============
@@ -136,7 +116,7 @@ func (ip *IpStack) Initialize(config *lnxconfig.IPConfig) {
 					continue
 				}
 				ip.RIPTo[neighbor] = &vrouter.NeighborRouterInfo{
-					OutgoingVIP:   subnet.VirtualIPAddr,
+					// OutgoingVIP:   subnet.VirtualIPAddr,
 					OutgoingConn:  subnet.ListenConn,
 					RouterUDPAddr: subnet.ARPTable[neighbor],
 				}
@@ -152,7 +132,6 @@ func (ip *IpStack) Initialize(config *lnxconfig.IPConfig) {
 			}
 			ip.ForwardingTable[k] = &NextHop{
 				NextHopVIPAddr: v,
-				NextHopUDPAddr: intf.ARPTable[v],
 				EntryType:      util.HOP_STATIC,
 				HopCost:        0,
 				InterfaceName:  intf.InterfaceName,
@@ -162,11 +141,10 @@ func (ip *IpStack) Initialize(config *lnxconfig.IPConfig) {
 	// Local Interfaces
 	for k, v := range ip.Subnets {
 		ip.ForwardingTable[k] = &NextHop{
-			NextHopVIPAddr: v.VirtualIPAddr,
-			NextHopUDPAddr: v.MacAddr,
-			EntryType:      util.HOP_LOCAL,
-			HopCost:        0,
-			InterfaceName:  v.InterfaceName,
+			NextHopVIPAddr: v.IPAddr,
+			EntryType:     util.HOP_LOCAL,
+			HopCost:       0,
+			InterfaceName: v.InterfaceName,
 		}
 	}
 
@@ -196,19 +174,14 @@ func (ip *IpStack) RegisterHandler(proto uint8, handler ProtocolHandler) {
 	ip.ProtocolHandlerMap[proto] = handler
 }
 
-// For each interface, start listening at the UDP port
+// For each interface we have, initialize and start listening
 func (ip *IpStack) InitializeInterfaces() {
-	for _, i := range ip.Subnets {
-		udpAddr, err := net.ResolveUDPAddr("udp4", i.MacAddr.String())
+	for _, li := range ip.Subnets {
+		err := li.InitializeLink()
 		if err != nil {
 			panic(err)
 		}
-		conn, err := net.ListenUDP("udp4", udpAddr)
-		if err != nil {
-			panic(err)
-		}
-		i.ListenConn = conn
-		go link.ListenAtInterface(conn, ip.IpPacketChan, ip.errorChan)
+		go li.ListenAtInterface(ip.IpPacketChan, ip.errorChan)
 	}
 }
 
@@ -216,22 +189,37 @@ func (ip *IpStack) InitializeInterfaces() {
 func (ip *IpStack) ProcessPackets() {
 	for {
 		select {
-			// Packets sent from the Link Layer
+		// Packets sent from the Link Layer
 		case packet := <-ip.IpPacketChan:
+			// Check if I am the intended destination
 			if ip.IsThisMyPacket(packet.IPHeader.Dst) {
-				// Packet is for me
 				ip.ProtocolHandlerMap[uint8(packet.IPHeader.Protocol)](packet)
 				continue
 			}
-			// Get the next hop
-			nextHop, prefix := ip.GetNextHop(packet.IPHeader.Dst)
-			nextUdpAddr := nextHop.NextHopUDPAddr
-			nextUdpConn := ip.Subnets[ip.NameToPrefix[nextHop.InterfaceName]].ListenConn
-			if _, ok := ip.Subnets[prefix]; ok {
-				// If one of my subnets, local delivery
-				nextUdpAddr = ip.Subnets[prefix].ARPTable[packet.IPHeader.Dst]
+			// Check TTL. Drop if cannot forward
+			if packet.IPHeader.TTL <= 1 {
+				ip.errorChan <- "TTL reached 0!\n"
+				continue
 			}
-			ip.SendPacketTo(packet, nextUdpAddr, nextUdpConn, true)
+			// Get the next hop
+			nextHop, found := ip.GetNextHop(packet.IPHeader.Dst)
+			if !found {
+				ip.errorChan <- "NextHop not found!\n"
+				continue
+			}
+			// Get the link to send out from
+			link := ip.Subnets[ip.NameToPrefix[nextHop.InterfaceName]]
+			var err error
+			if nextHop.EntryType == util.HOP_LOCAL {
+				// LOCAL delivery
+				err = link.SendLocal(packet, packet.IPHeader.Dst, true)
+			} else {
+				// FORWARD
+				err = link.SendLocal(packet, nextHop.NextHopVIPAddr, true)
+			}
+			if err != nil {
+				ip.errorChan <- err.Error()
+			}
 		case errStr := <-ip.errorChan:
 			ip.Writer.WriteString("\nERROR: " + errStr)
 			ip.Writer.Flush()
@@ -243,10 +231,10 @@ func (ip *IpStack) ProcessPackets() {
 }
 
 // Helper to check if this packet is destined to one of my interfaces
+// if so, dst should match to one of our links' assigned IPAddr
 func (ip *IpStack) IsThisMyPacket(dst netip.Addr) bool {
 	for _, i := range ip.Subnets {
-		if dst.Compare(i.VirtualIPAddr) == 0 {
-			// This is for me
+		if dst.Compare(i.IPAddr) == 0 {
 			return true
 		}
 	}
@@ -255,47 +243,24 @@ func (ip *IpStack) IsThisMyPacket(dst netip.Addr) bool {
 
 // Given a destination IP Address, consult the forwarding table to get next hop
 // Performs a Longest Prefix Matching
-func (ip *IpStack) GetNextHop(dst netip.Addr) (NextHop, netip.Prefix) {
+func (ip *IpStack) GetNextHop(dst netip.Addr) (NextHop, bool) {
 	// Check Forwarding Table
 	longest := -1
 	var niHop NextHop
-	var rprefix netip.Prefix
 	for prefix, nihop := range ip.ForwardingTable {
 		if prefix.Contains(dst) {
 			sharedBits := util.GetNumSharedPrefix(dst, prefix.Addr())
 			if longest < sharedBits {
 				longest = sharedBits
 				niHop = *nihop
-				rprefix = prefix
 			}
 		}
 	}
-	return niHop, rprefix
-}
 
-// Send a packet to "udpAddr"
-func (ip *IpStack) SendPacketTo(packet *packet.Packet, udpAddr netip.AddrPort, udpConn *net.UDPConn, forward bool) {
-	var newTTL int = packet.IPHeader.TTL
-	if forward {
-		// If forwarding, decrement the TTL
-		newTTL := packet.IPHeader.TTL - 1
-		if newTTL < 0 {
-			ip.errorChan <- "TTL reached below 0. Dropping it!\n"
-			return
-		}
+	if longest == -1 {
+		// Not found
+		return NextHop{}, false
 	}
-	// Recompute Checksum for this packet
-	packet.IPHeader.TTL = newTTL
-	packet.IPHeader.Checksum = 0
-	headerBytes, err := packet.IPHeader.Marshal()
-	if err != nil {
-		ip.errorChan <- err.Error()
-		return
-	}
-	newCheckSum := util.ComputeChecksum(headerBytes)
-	packet.IPHeader.Checksum = int(newCheckSum)
-	// Forward
-	packetBytes := packet.Marshal()
-	resolvedUdpAddr, _ := net.ResolveUDPAddr("udp4", udpAddr.String())
-	udpConn.WriteToUDP(packetBytes, resolvedUdpAddr)
+
+	return niHop, true
 }
