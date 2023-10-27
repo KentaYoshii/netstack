@@ -35,32 +35,6 @@ type RIPMessage struct {
 	Entries    []*RIPMessageEntry
 }
 
-// func RequestRoutingInfo(ripTo map[netip.Addr]*NeighborRouterInfo) error {
-// 	newRequestMessage := RIPMessage{
-// 		Command:    1,
-// 		NumEntries: 0,
-// 	}
-// 	buf := new(bytes.Buffer)
-// 	err := binary.Write(buf, binary.BigEndian, newRequestMessage.Command)
-// 	if err != nil {
-// 		return err
-// 	}
-// 	err = binary.Write(buf, binary.BigEndian, newRequestMessage.NumEntries)
-// 	if err != nil {
-// 		return err
-// 	}
-// 	bytes := buf.Bytes()
-// 	for dst, neighbor := range ripTo {
-// 		newPacket := packet.CreateNewPacket(bytes, neighbor.OutgoingVIP, dst, util.RIP_PROTO)
-// 		packet.SetCheckSumFor(newPacket)
-// 		_, err := neighbor.OutgoingConn.WriteToUDP(newPacket.Marshal(), neighbor.RouterUDPAddr)
-// 		if err != nil {
-// 			return err
-// 		}
-// 	}
-// 	return nil
-// }
-
 // // Entry function for rip protocol
 // func SendOutRIPMessages(ripTo map[netip.Addr]NeighborRouterInfo,
 // 	ft map[netip.Prefix]*NextHop, mySubnets []netip.Prefix) error {

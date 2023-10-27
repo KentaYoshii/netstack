@@ -5,7 +5,9 @@ import (
 	"net"
 	"net/netip"
 	"netstack/pkg/packet"
+	"netstack/pkg/proto"
 	"netstack/pkg/util"
+	"time"
 )
 
 type Link struct {
@@ -23,8 +25,12 @@ type Link struct {
 	IsUp bool
 	// Subnet Prefix that it is connected to
 	Subnet netip.Prefix
+
+	// Chan
+	ErrorChan chan string
 }
 
+// Function that initializes the Link by start listening at the assigned UDP address
 func (li *Link) InitializeLink() error {
 	udpAddr, err := net.ResolveUDPAddr("udp4", li.ListenAddr.String())
 	if err != nil {
@@ -36,6 +42,12 @@ func (li *Link) InitializeLink() error {
 	}
 	li.ListenConn = conn
 	return nil
+}
+
+// Given IP address and corresponding MAC address,
+// add the pair to the ARP table
+func (li *Link) AddNeighbor(nIP netip.Addr, nMAC netip.AddrPort) {
+	li.ARPTable[nIP] = nMAC
 }
 
 // Given one of the LOCAL destinatio IP address, use the ARP table to
@@ -89,6 +101,10 @@ func (li *Link) ListenAtInterface(packetChan chan *packet.Packet, errorChan chan
 			errorChan <- err.Error()
 			continue
 		}
+		// Check Link State
+		if !li.IsUp {
+			continue
+		}
 		header, err := util.ParseHeader(buf)
 		if err != nil {
 			errorChan <- err.Error()
@@ -106,6 +122,58 @@ func (li *Link) ListenAtInterface(packetChan chan *packet.Packet, errorChan chan
 		packetChan <- &packet.Packet{
 			IPHeader: header,
 			Payload:  buf[header.Len:],
+		}
+	}
+}
+
+// Function to send a request for routes message to the "neighbor"
+func (li *Link) RequestRouteFrom(neighbor netip.Addr) {
+	// Create the Payload for RIP Request Message
+	payload, err := proto.CreateRIPRequestPayload()
+	if err != nil {
+		li.ErrorChan <- err.Error()
+		return
+	}
+	// Create the packet
+	packet := packet.CreateNewPacket(payload, li.IPAddr, neighbor, util.RIP_PROTO)
+	// Send to the neighbor router
+	err = li.SendLocal(packet, neighbor, false)
+	if err != nil {
+		li.ErrorChan <- err.Error()
+		return
+	}
+}
+
+// Function that periodically updates the neighbor with its routes every 5 seconds
+func (li *Link) SendPeriodicUpdatesTo(neighbor netip.Addr) {
+
+	ticker := time.NewTicker(5 * time.Second)
+
+	for range ticker.C {
+		// Get Current Entries
+		nextHopEntries := proto.GetAllEntries()
+		// Apply Poison Reverse
+		ripEntries, err := proto.PoisonReverse(nextHopEntries, neighbor)
+		if err != nil {
+			li.ErrorChan <- err.Error()
+			continue
+		}
+		// Marshal
+		entBytes, err := proto.MarshalRIPEntries(ripEntries)
+		if err != nil {
+			li.ErrorChan <- err.Error()
+		}
+		// Create the rip packet
+		ripBytes, err := proto.CreateRIPPacketPayload(entBytes)
+		if err != nil {
+			li.ErrorChan <- err.Error()
+		}
+		packet := packet.CreateNewPacket(ripBytes, li.IPAddr, neighbor, util.RIP_PROTO)
+		// Send to the neighbor router
+		err = li.SendLocal(packet, neighbor, false)
+		if err != nil {
+			li.ErrorChan <- err.Error()
+			return
 		}
 	}
 }

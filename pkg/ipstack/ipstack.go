@@ -8,21 +8,9 @@ import (
 	"netstack/pkg/packet"
 	"netstack/pkg/proto"
 	"netstack/pkg/util"
-	"netstack/pkg/vrouter"
 	"os"
 	"time"
 )
-
-type NextHop struct {
-	// VIPAddress of our next hop
-	NextHopVIPAddr netip.Addr
-	// Cost (infinity = 16)
-	HopCost uint32
-	// Type
-	EntryType util.HopType
-	// Interface name
-	InterfaceName string
-}
 
 type ProtocolHandler func(*packet.Packet)
 
@@ -41,7 +29,7 @@ type IpStack struct {
 	// Map for protocol number to higher layer handler function
 	ProtocolHandlerMap map[uint8]ProtocolHandler
 	// Forwarding Table (map from Network Prefix to NextHop IP)
-	ForwardingTable map[netip.Prefix]*NextHop
+	ForwardingTable map[netip.Prefix]*proto.NextHop
 	// Interface name to Prefix Address
 	NameToPrefix map[string]netip.Prefix
 
@@ -49,14 +37,12 @@ type IpStack struct {
 
 	// Channel through whicn interfaces send IP packets to network layer
 	IpPacketChan chan *packet.Packet
+	// Channel through which new route entries are sent
+	RouteChan chan *proto.NextHop
 	// Channel for getting non-serious error messages
 	errorChan chan string
 	// Debugging
 	InfoChan chan string
-
-	// ----- ROUTERS specific -----
-	// Map from neighbor router ip address udp conn
-	RIPTo map[netip.Addr]*vrouter.NeighborRouterInfo
 }
 
 // Create new IP stack
@@ -66,7 +52,7 @@ func CreateIPStack() *IpStack {
 		RipEnabled:         false,
 		Subnets:            make(map[netip.Prefix]*link.Link),
 		ProtocolHandlerMap: make(map[uint8]ProtocolHandler),
-		ForwardingTable:    make(map[netip.Prefix]*NextHop),
+		ForwardingTable:    make(map[netip.Prefix]*proto.NextHop),
 		NameToPrefix:       make(map[string]netip.Prefix),
 		IpPacketChan:       make(chan *packet.Packet, 100),
 		errorChan:          make(chan string, 100),
@@ -86,13 +72,14 @@ func (ip *IpStack) Initialize(config *lnxconfig.IPConfig) {
 			InterfaceName: i.Name,
 			IsUp:          true,
 			Subnet:        i.AssignedPrefix,
+			ErrorChan:     ip.errorChan,
 		}
 	}
 	// =============== ARP Table ===============
 	for _, n := range config.Neighbors {
-		for prefix, intf := range ip.Subnets {
+		for prefix, li := range ip.Subnets {
 			if prefix.Contains(n.DestAddr) {
-				intf.ARPTable[n.DestAddr] = n.UDPAddr
+				li.AddNeighbor(n.DestAddr, n.UDPAddr)
 			}
 		}
 	}
@@ -102,35 +89,15 @@ func (ip *IpStack) Initialize(config *lnxconfig.IPConfig) {
 	// Let the port binding complete
 	time.Sleep(time.Millisecond * util.INITIAL_SETUP_TO)
 
-	// ================== RIP ==================
-	if config.RoutingMode == lnxconfig.RoutingTypeRIP {
-		ip.RipEnabled = true
-	} else {
-		ip.RipEnabled = false
-	}
-	if ip.RipEnabled {
-		ip.RIPTo = make(map[netip.Addr]*vrouter.NeighborRouterInfo)
-		for _, subnet := range ip.Subnets {
-			for _, neighbor := range config.RipNeighbors {
-				if !subnet.Subnet.Contains(neighbor) {
-					continue
-				}
-				ip.RIPTo[neighbor] = &vrouter.NeighborRouterInfo{
-					// OutgoingVIP:   subnet.VirtualIPAddr,
-					OutgoingConn:  subnet.ListenConn,
-					RouterUDPAddr: subnet.ARPTable[neighbor],
-				}
-			}
-		}
-	}
-	// ============ Forwarding Table ============
+		// ============ Forwarding Table ============
 	// Static Routes (default gateway)
 	for k, v := range config.StaticRoutes {
 		for prefix, intf := range ip.Subnets {
 			if !prefix.Contains(v) {
 				continue
 			}
-			ip.ForwardingTable[k] = &NextHop{
+			ip.ForwardingTable[k] = &proto.NextHop{
+				Prefix:         prefix,
 				NextHopVIPAddr: v,
 				EntryType:      util.HOP_STATIC,
 				HopCost:        0,
@@ -140,11 +107,33 @@ func (ip *IpStack) Initialize(config *lnxconfig.IPConfig) {
 	}
 	// Local Interfaces
 	for k, v := range ip.Subnets {
-		ip.ForwardingTable[k] = &NextHop{
+		ip.ForwardingTable[k] = &proto.NextHop{
+			Prefix:         k,
 			NextHopVIPAddr: v.IPAddr,
-			EntryType:     util.HOP_LOCAL,
-			HopCost:       0,
-			InterfaceName: v.InterfaceName,
+			EntryType:      util.HOP_LOCAL,
+			HopCost:        0,
+			InterfaceName:  v.InterfaceName,
+		}
+	}
+
+	// ================== RIP ==================
+	if config.RoutingMode == lnxconfig.RoutingTypeRIP {
+		ip.RipEnabled = true
+		proto.InitializeRoutingTable(ip.ForwardingTable)
+	} else {
+		ip.RipEnabled = false
+	}
+	if ip.RipEnabled {
+		for _, neighbor := range config.RipNeighbors {
+			for prefix, li := range ip.Subnets {
+				if prefix.Contains(neighbor) {
+					// Request Route 
+					li.RequestRouteFrom(neighbor)
+					// Start Periodic Updates
+					go li.SendPeriodicUpdatesTo(neighbor)
+					break
+				}
+			}
 		}
 	}
 
@@ -243,10 +232,10 @@ func (ip *IpStack) IsThisMyPacket(dst netip.Addr) bool {
 
 // Given a destination IP Address, consult the forwarding table to get next hop
 // Performs a Longest Prefix Matching
-func (ip *IpStack) GetNextHop(dst netip.Addr) (NextHop, bool) {
+func (ip *IpStack) GetNextHop(dst netip.Addr) (proto.NextHop, bool) {
 	// Check Forwarding Table
 	longest := -1
-	var niHop NextHop
+	var niHop proto.NextHop
 	for prefix, nihop := range ip.ForwardingTable {
 		if prefix.Contains(dst) {
 			sharedBits := util.GetNumSharedPrefix(dst, prefix.Addr())
@@ -259,7 +248,7 @@ func (ip *IpStack) GetNextHop(dst netip.Addr) (NextHop, bool) {
 
 	if longest == -1 {
 		// Not found
-		return NextHop{}, false
+		return proto.NextHop{}, false
 	}
 
 	return niHop, true
