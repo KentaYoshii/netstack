@@ -18,7 +18,7 @@ const (
 )
 
 type RoutingTableT struct {
-	entries         map[netip.Prefix]NextHop
+	Entries         map[netip.Prefix]NextHop
 	RouteUpdateChan chan NextHop
 }
 
@@ -60,7 +60,7 @@ type RIPMessageEntry struct {
 var RoutingTable RoutingTableT
 
 // Mutex
-var rtMtx sync.Mutex
+var RtMtx sync.Mutex
 
 // Update Channel
 var updateChan chan NextHop
@@ -68,11 +68,10 @@ var updateChan chan NextHop
 // Initialize the routing table with immutable local&static routes
 func InitializeRoutingTable(from map[netip.Prefix]NextHop, uchan chan NextHop) {
 	RoutingTable = RoutingTableT{
-		entries:         make(map[netip.Prefix]NextHop),
-		RouteUpdateChan: updateChan,
+		Entries:         make(map[netip.Prefix]NextHop),
 	}
 	for prefix, nh := range from {
-		RoutingTable.entries[prefix] = NextHop{
+		RoutingTable.Entries[prefix] = NextHop{
 			Prefix:         nh.Prefix,
 			NextHopVIPAddr: nh.NextHopVIPAddr,
 			HopCost:        nh.HopCost,
@@ -106,11 +105,11 @@ func CreateRIPRequestPayload() ([]byte, error) {
 
 // Get all entries from the routing table
 func GetAllEntries() []NextHop {
-	rtMtx.Lock()
-	defer rtMtx.Unlock()
+	RtMtx.Lock()
+	defer RtMtx.Unlock()
 
 	entries := make([]NextHop, 0)
-	for _, ent := range RoutingTable.entries {
+	for _, ent := range RoutingTable.Entries {
 		entries = append(entries, ent)
 	}
 	return entries
@@ -242,8 +241,8 @@ func RefreshTable() {
 	ticker := time.NewTicker(1 * time.Second)
 
 	for range ticker.C {
-		rtMtx.Lock()
-		for _, ent := range RoutingTable.entries {
+		RtMtx.Lock()
+		for _, ent := range RoutingTable.Entries {
 			// Local or Static Routes are immutable
 			if ent.EntryType == util.HOP_LOCAL || ent.EntryType == util.HOP_STATIC {
 				continue
@@ -252,13 +251,13 @@ func RefreshTable() {
 			diff := now.Sub(ent.UpdatedAt)
 			if diff.Seconds() >= 12 {
 				// entry expired! remove
-				delete(RoutingTable.entries, ent.Prefix)
+				delete(RoutingTable.Entries, ent.Prefix)
 				// trigger the update
 				ent.Expired = true
 				updateChan <- ent
 			}
 		}
-		rtMtx.Unlock()
+		RtMtx.Unlock()
 	}
 }
 
@@ -273,10 +272,10 @@ func RefreshTable() {
 // - NextHop Cost Increase
 //   - announcedPrefix is known and it is from the nexthop -> Update
 func ProcessRIPEntry(announcedPrefix netip.Prefix, cost uint32, from netip.Addr) {
-	rtMtx.Lock()
-	defer rtMtx.Unlock()
+	RtMtx.Lock()
+	defer RtMtx.Unlock()
 	// Check if we have this prefix
-	ent, ok := RoutingTable.entries[announcedPrefix]
+	ent, ok := RoutingTable.Entries[announcedPrefix]
 
 	if !ok {
 		// Unknown prefix
@@ -293,7 +292,7 @@ func ProcessRIPEntry(announcedPrefix netip.Prefix, cost uint32, from netip.Addr)
 			Expired:        false,
 			UpdatedAt:      time.Now(),
 		}
-		RoutingTable.entries[announcedPrefix] = newEnt
+		RoutingTable.Entries[announcedPrefix] = newEnt
 		updateChan <- newEnt
 	} else {
 		newCost := cost + 1
@@ -307,7 +306,7 @@ func ProcessRIPEntry(announcedPrefix netip.Prefix, cost uint32, from netip.Addr)
 			// If coming from same nexthop
 			if newCost >= INF {
 				// If cost is INF (link is down)
-				delete(RoutingTable.entries, announcedPrefix)
+				delete(RoutingTable.Entries, announcedPrefix)
 				ent.Expired = true
 				updateChan <- ent
 				return
@@ -315,12 +314,13 @@ func ProcessRIPEntry(announcedPrefix netip.Prefix, cost uint32, from netip.Addr)
 			if newCost == ent.HopCost {
 				// Same hop, same cost, just update
 				ent.UpdatedAt = time.Now()
+				RoutingTable.Entries[announcedPrefix] = ent
 				return
 			} else {
 				// Update to whatever the advertised cost is
 				ent.UpdatedAt = time.Now()
 				ent.HopCost = newCost
-				RoutingTable.entries[announcedPrefix] = ent
+				RoutingTable.Entries[announcedPrefix] = ent
 				updateChan <- ent
 				return
 			}
@@ -334,7 +334,7 @@ func ProcessRIPEntry(announcedPrefix netip.Prefix, cost uint32, from netip.Addr)
 			ent.HopCost = newCost
 			ent.NextHopVIPAddr = from
 			ent.UpdatedAt = time.Now()
-			RoutingTable.entries[announcedPrefix] = ent
+			RoutingTable.Entries[announcedPrefix] = ent
 			updateChan <- ent
 			return 
 		}

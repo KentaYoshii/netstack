@@ -6,6 +6,7 @@ import (
 	"net/netip"
 	"netstack/pkg/ipstack"
 	"netstack/pkg/packet"
+	"netstack/pkg/proto"
 	"netstack/pkg/util"
 	"os"
 	"strings"
@@ -146,7 +147,9 @@ func (r *Repl) handleListRoutes(args []string) string {
 	b.WriteString(fmt.Sprintf("%-6s %-15s %-10s %s\n", "T", "Prefix", "Next hop", "COST"))
 	b.WriteString(fmt.Sprintf("%-6s %-15s %-10s %s\n", "-", "------", "--------", "----"))
 	// Loop our routing table next
-	for prefix, ent := range r.HostInfo.ForwardingTable {
+	proto.RtMtx.Lock()
+	defer proto.RtMtx.Unlock()
+	for prefix, ent := range proto.RoutingTable.Entries {
 		var cost, t, name string
 		if ent.EntryType == util.HOP_STATIC {
 			name = ent.NextHopVIPAddr.String()
@@ -244,7 +247,7 @@ func (r *Repl) handleUp(args []string) string {
 		return b.String()
 	}
 	target := args[1]
-	for _, li := range r.HostInfo.Subnets {
+	for prefix, li := range r.HostInfo.Subnets {
 		if li.InterfaceName == target {
 			if li.IsUp {
 				// no op
@@ -252,6 +255,23 @@ func (r *Repl) handleUp(args []string) string {
 				return b.String()
 			}
 			li.IsUp = true
+
+			// Add back and Trigger Updates about the up status
+			newHop := proto.NextHop {
+				Prefix: prefix,
+				NextHopVIPAddr: li.IPAddr,
+				HopCost: 0,
+				EntryType: util.HOP_LOCAL,
+				InterfaceName: li.InterfaceName,
+			}
+
+			proto.RtMtx.Lock()
+			proto.RoutingTable.Entries[prefix] = newHop
+			proto.RtMtx.Unlock()
+
+			for _, triChan := range r.HostInfo.TriggerChans {
+				triChan <- newHop
+			}
 			return b.String()
 		}
 	}
@@ -267,7 +287,7 @@ func (r *Repl) handleDown(args []string) string {
 		return b.String()
 	}
 	target := args[1]
-	for _, li := range r.HostInfo.Subnets {
+	for prefix, li := range r.HostInfo.Subnets {
 		if li.InterfaceName == target {
 			if !li.IsUp {
 				// no op
@@ -275,6 +295,23 @@ func (r *Repl) handleDown(args []string) string {
 				return b.String()
 			}
 			li.IsUp = false
+
+			// Remove from the routing table
+			proto.RtMtx.Lock()
+			delete(proto.RoutingTable.Entries, prefix)
+			proto.RtMtx.Unlock()
+
+			// Trigger Updates about the down status
+			newHop := proto.NextHop {
+				Prefix: prefix,
+				NextHopVIPAddr: li.IPAddr,
+				HopCost: proto.INF,
+				EntryType: util.HOP_LOCAL,
+				InterfaceName: li.InterfaceName,
+			}
+			for _, triChan := range r.HostInfo.TriggerChans {
+				triChan <- newHop
+			}
 			return b.String()
 		}
 	}

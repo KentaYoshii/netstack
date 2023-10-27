@@ -40,6 +40,8 @@ type IpStack struct {
 	IpPacketChan chan *packet.Packet
 	// Channel through which new route entries are sent
 	RouteChan chan proto.NextHop
+	// Channels through which triggered updates are communicated
+	TriggerChans []chan proto.NextHop
 	// Channel for getting non-serious error messages
 	errorChan chan string
 	// Debugging
@@ -136,8 +138,10 @@ func (ip *IpStack) Initialize(config *lnxconfig.IPConfig) {
 				if prefix.Contains(neighbor) {
 					// Request Route
 					li.RequestRouteFrom(neighbor)
-					// Start Periodic Updates
-					go li.SendPeriodicUpdatesTo(neighbor)
+					// Start Periodic Updates + monitor triggered updates
+					triChan := make(chan proto.NextHop, 100)
+					ip.TriggerChans = append(ip.TriggerChans, triChan)
+					go li.SendUpdatesTo(neighbor, triChan)
 					break
 				}
 			}
@@ -226,7 +230,6 @@ func (ip *IpStack) ProcessPackets() {
 func (ip *IpStack) CheckForRouteUpdates() {
 	for r := range ip.RouteChan {
 		ip.ftMtx.Lock()
-
 		if r.Expired {
 			// This route update is for delete (expired)
 			_, ok := ip.ForwardingTable[r.Prefix]
@@ -234,6 +237,7 @@ func (ip *IpStack) CheckForRouteUpdates() {
 				panic("trying to delete non-existent entry")
 			}
 			delete(ip.ForwardingTable, r.Prefix)
+			r.HopCost = proto.INF // unreachability
 		} else {
 			// This route update is for upgrade
 			// Add the new route
@@ -241,8 +245,12 @@ func (ip *IpStack) CheckForRouteUpdates() {
 			r.InterfaceName = nh.InterfaceName
 			ip.ForwardingTable[r.Prefix] = r
 		}
-
 		ip.ftMtx.Unlock()
+
+		// Trigger update to neighbors
+		for _, triChan := range ip.TriggerChans {
+			triChan <- r
+		}
 	}
 }
 

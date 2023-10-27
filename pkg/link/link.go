@@ -144,36 +144,77 @@ func (li *Link) RequestRouteFrom(neighbor netip.Addr) {
 	}
 }
 
+// Function that handles a single trigger update to a neighbor "neighbor"
+func (li *Link) TriggerUpdateTo(neighbor netip.Addr, newEntry proto.NextHop) {
+	temp := make([]proto.NextHop, 0)
+	temp = append(temp, newEntry)
+	// Apply Poison Reverse
+	ripEntries, err := proto.PoisonReverse(temp, neighbor)
+	if err != nil {
+		li.ErrorChan <- err.Error()
+		return
+	}
+	// Marshal
+	entBytes, err := proto.MarshalRIPEntries(ripEntries)
+	if err != nil {
+		li.ErrorChan <- err.Error()
+		return
+	}
+	// Create the rip packet
+	ripBytes, err := proto.CreateRIPPacketPayload(entBytes)
+	if err != nil {
+		li.ErrorChan <- err.Error()
+		return
+	}
+	packet := packet.CreateNewPacket(ripBytes, li.IPAddr, neighbor, util.RIP_PROTO)
+	// Send to the neighbor router
+	err = li.SendLocal(packet, neighbor, false)
+	if err != nil {
+		li.ErrorChan <- err.Error()
+		return
+	}
+}
+
+
 // Function that periodically updates the neighbor with its routes every 5 seconds
-func (li *Link) SendPeriodicUpdatesTo(neighbor netip.Addr) {
+// If trigger update, then send the new entry
+func (li *Link) SendUpdatesTo(neighbor netip.Addr, triggerChan chan proto.NextHop) {
 
 	ticker := time.NewTicker(5 * time.Second)
 
-	for range ticker.C {
-		// Get Current Entries
-		nextHopEntries := proto.GetAllEntries()
-		// Apply Poison Reverse
-		ripEntries, err := proto.PoisonReverse(nextHopEntries, neighbor)
-		if err != nil {
-			li.ErrorChan <- err.Error()
-			continue
+	for {
+		select {
+		case <- ticker.C: {
+				// Get Current Entries
+				nextHopEntries := proto.GetAllEntries()
+				// Apply Poison Reverse
+				ripEntries, err := proto.PoisonReverse(nextHopEntries, neighbor)
+				if err != nil {
+					li.ErrorChan <- err.Error()
+					continue
+				}
+				// Marshal
+				entBytes, err := proto.MarshalRIPEntries(ripEntries)
+				if err != nil {
+					li.ErrorChan <- err.Error()
+				}
+				// Create the rip packet
+				ripBytes, err := proto.CreateRIPPacketPayload(entBytes)
+				if err != nil {
+					li.ErrorChan <- err.Error()
+				}
+				packet := packet.CreateNewPacket(ripBytes, li.IPAddr, neighbor, util.RIP_PROTO)
+				// Send to the neighbor router
+				err = li.SendLocal(packet, neighbor, false)
+				if err != nil {
+					li.ErrorChan <- err.Error()
+					continue
+				}
+			}
+		case update := <- triggerChan: {
+			// Trigger Update!
+			li.TriggerUpdateTo(neighbor, update)
 		}
-		// Marshal
-		entBytes, err := proto.MarshalRIPEntries(ripEntries)
-		if err != nil {
-			li.ErrorChan <- err.Error()
 		}
-		// Create the rip packet
-		ripBytes, err := proto.CreateRIPPacketPayload(entBytes)
-		if err != nil {
-			li.ErrorChan <- err.Error()
-		}
-		packet := packet.CreateNewPacket(ripBytes, li.IPAddr, neighbor, util.RIP_PROTO)
-		// Send to the neighbor router
-		err = li.SendLocal(packet, neighbor, false)
-		if err != nil {
-			li.ErrorChan <- err.Error()
-			return
-		}
-	}
+	} 
 }
