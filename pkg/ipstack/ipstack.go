@@ -9,6 +9,7 @@ import (
 	"netstack/pkg/proto"
 	"netstack/pkg/util"
 	"os"
+	"sync"
 	"time"
 )
 
@@ -29,7 +30,7 @@ type IpStack struct {
 	// Map for protocol number to higher layer handler function
 	ProtocolHandlerMap map[uint8]ProtocolHandler
 	// Forwarding Table (map from Network Prefix to NextHop IP)
-	ForwardingTable map[netip.Prefix]*proto.NextHop
+	ForwardingTable map[netip.Prefix]proto.NextHop
 	// Interface name to Prefix Address
 	NameToPrefix map[string]netip.Prefix
 
@@ -38,11 +39,14 @@ type IpStack struct {
 	// Channel through whicn interfaces send IP packets to network layer
 	IpPacketChan chan *packet.Packet
 	// Channel through which new route entries are sent
-	RouteChan chan *proto.NextHop
+	RouteChan chan proto.NextHop
 	// Channel for getting non-serious error messages
 	errorChan chan string
 	// Debugging
 	InfoChan chan string
+
+	// Concurrency
+	ftMtx sync.Mutex
 }
 
 // Create new IP stack
@@ -52,9 +56,10 @@ func CreateIPStack() *IpStack {
 		RipEnabled:         false,
 		Subnets:            make(map[netip.Prefix]*link.Link),
 		ProtocolHandlerMap: make(map[uint8]ProtocolHandler),
-		ForwardingTable:    make(map[netip.Prefix]*proto.NextHop),
+		ForwardingTable:    make(map[netip.Prefix]proto.NextHop),
 		NameToPrefix:       make(map[string]netip.Prefix),
 		IpPacketChan:       make(chan *packet.Packet, 100),
+		RouteChan:          make(chan proto.NextHop, 100),
 		errorChan:          make(chan string, 100),
 		InfoChan:           make(chan string, 100),
 	}
@@ -89,37 +94,39 @@ func (ip *IpStack) Initialize(config *lnxconfig.IPConfig) {
 	// Let the port binding complete
 	time.Sleep(time.Millisecond * util.INITIAL_SETUP_TO)
 
-		// ============ Forwarding Table ============
+	// ============ Forwarding Table ============
 	// Static Routes (default gateway)
 	for k, v := range config.StaticRoutes {
 		for prefix, intf := range ip.Subnets {
 			if !prefix.Contains(v) {
 				continue
 			}
-			ip.ForwardingTable[k] = &proto.NextHop{
+			ip.ForwardingTable[k] = proto.NextHop{
 				Prefix:         prefix,
 				NextHopVIPAddr: v,
 				EntryType:      util.HOP_STATIC,
 				HopCost:        0,
 				InterfaceName:  intf.InterfaceName,
+				Expired:        false,
 			}
 		}
 	}
 	// Local Interfaces
 	for k, v := range ip.Subnets {
-		ip.ForwardingTable[k] = &proto.NextHop{
+		ip.ForwardingTable[k] = proto.NextHop{
 			Prefix:         k,
 			NextHopVIPAddr: v.IPAddr,
 			EntryType:      util.HOP_LOCAL,
 			HopCost:        0,
 			InterfaceName:  v.InterfaceName,
+			Expired:        false,
 		}
 	}
 
 	// ================== RIP ==================
 	if config.RoutingMode == lnxconfig.RoutingTypeRIP {
 		ip.RipEnabled = true
-		proto.InitializeRoutingTable(ip.ForwardingTable)
+		proto.InitializeRoutingTable(ip.ForwardingTable, ip.RouteChan)
 	} else {
 		ip.RipEnabled = false
 	}
@@ -127,7 +134,7 @@ func (ip *IpStack) Initialize(config *lnxconfig.IPConfig) {
 		for _, neighbor := range config.RipNeighbors {
 			for prefix, li := range ip.Subnets {
 				if prefix.Contains(neighbor) {
-					// Request Route 
+					// Request Route
 					li.RequestRouteFrom(neighbor)
 					// Start Periodic Updates
 					go li.SendPeriodicUpdatesTo(neighbor)
@@ -147,15 +154,11 @@ func (ip *IpStack) Initialize(config *lnxconfig.IPConfig) {
 	// ICMP PROTOCOL
 	ip.ProtocolHandlerMap[util.ICMP_PROTO] = proto.HandleICMProtocol
 
+	// =========== Routines =============
 	// Start processing incoming packets
 	go ip.ProcessPackets()
-
-	// Request routing information
-	if ip.RipEnabled {
-		// if err := vrouter.RequestRoutingInfo(ip.RIPTo); err != nil {
-		// 	ip.errorChan <- err.Error()
-		// }
-	}
+	// Start monitoring route updates
+	go ip.CheckForRouteUpdates()
 }
 
 // Register a handler
@@ -219,6 +222,30 @@ func (ip *IpStack) ProcessPackets() {
 	}
 }
 
+// A new/better route is sent to the "RouteChan" so keep monitoring
+func (ip *IpStack) CheckForRouteUpdates() {
+	for r := range ip.RouteChan {
+		ip.ftMtx.Lock()
+
+		if r.Expired {
+			// This route update is for delete (expired)
+			_, ok := ip.ForwardingTable[r.Prefix]
+			if !ok {
+				panic("trying to delete non-existent entry")
+			}
+			delete(ip.ForwardingTable, r.Prefix)
+		} else {
+			// This route update is for upgrade
+			// Add the new route
+			nh, _ := ip.GetNextHop(r.NextHopVIPAddr)
+			r.InterfaceName = nh.InterfaceName
+			ip.ForwardingTable[r.Prefix] = r
+		}
+
+		ip.ftMtx.Unlock()
+	}
+}
+
 // Helper to check if this packet is destined to one of my interfaces
 // if so, dst should match to one of our links' assigned IPAddr
 func (ip *IpStack) IsThisMyPacket(dst netip.Addr) bool {
@@ -241,7 +268,7 @@ func (ip *IpStack) GetNextHop(dst netip.Addr) (proto.NextHop, bool) {
 			sharedBits := util.GetNumSharedPrefix(dst, prefix.Addr())
 			if longest < sharedBits {
 				longest = sharedBits
-				niHop = *nihop
+				niHop = nihop
 			}
 		}
 	}

@@ -3,13 +3,12 @@ package proto
 import (
 	"bytes"
 	"encoding/binary"
-	"fmt"
 	"net"
 	"net/netip"
 	"netstack/pkg/packet"
 	"netstack/pkg/util"
-	"strings"
 	"sync"
+	"time"
 )
 
 const (
@@ -19,7 +18,8 @@ const (
 )
 
 type RoutingTableT struct {
-	entries map[netip.Prefix]NextHop
+	entries         map[netip.Prefix]NextHop
+	RouteUpdateChan chan NextHop
 }
 
 type NextHop struct {
@@ -33,6 +33,10 @@ type NextHop struct {
 	EntryType util.HopType
 	// Interface name
 	InterfaceName string
+	// Expired
+	Expired bool
+	// Last Update At
+	UpdatedAt time.Time
 }
 
 type RIPMessage struct {
@@ -58,10 +62,14 @@ var RoutingTable RoutingTableT
 // Mutex
 var rtMtx sync.Mutex
 
+// Update Channel
+var updateChan chan NextHop
+
 // Initialize the routing table with immutable local&static routes
-func InitializeRoutingTable(from map[netip.Prefix]*NextHop) {
+func InitializeRoutingTable(from map[netip.Prefix]NextHop, uchan chan NextHop) {
 	RoutingTable = RoutingTableT{
-		entries: make(map[netip.Prefix]NextHop),
+		entries:         make(map[netip.Prefix]NextHop),
+		RouteUpdateChan: updateChan,
 	}
 	for prefix, nh := range from {
 		RoutingTable.entries[prefix] = NextHop{
@@ -72,6 +80,9 @@ func InitializeRoutingTable(from map[netip.Prefix]*NextHop) {
 			InterfaceName:  nh.InterfaceName,
 		}
 	}
+	updateChan = uchan
+	// Start a routine that continually monitors the routing table
+	go RefreshTable()
 }
 
 // Create the payload for RIP Request message
@@ -124,7 +135,7 @@ func NextHopToRIPEntry(entry NextHop) (RIPMessageEntry, error) {
 	}
 	return RIPMessageEntry{
 		NetworkAddr: networkAddr,
-		Mask: maskInt,
+		Mask:        maskInt,
 	}, nil
 }
 
@@ -169,6 +180,36 @@ func MarshalRIPEntries(entries []RIPMessageEntry) ([]byte, error) {
 	return buf.Bytes(), nil
 }
 
+// UnMarshal RIP Packet
+func UnMarshalRIPBytes(b []byte) RIPMessage {
+	offset := 0
+	// 2 bytes cmd type
+	cmdT := binary.BigEndian.Uint16(b[offset : offset+2])
+	offset += 2
+	// 2 bytes num entries
+	numEntries := binary.BigEndian.Uint16(b[offset : offset+2])
+	offset += 2
+	entries := make([]RIPMessageEntry, 0)
+	for i := 0; i < int(numEntries); i++ {
+		cost := binary.BigEndian.Uint32(b[offset : offset+4])
+		offset += 4
+		networkAddr := binary.BigEndian.Uint32(b[offset : offset+4])
+		offset += 4
+		mask := binary.BigEndian.Uint32(b[offset : offset+4])
+		offset += 4
+		entries = append(entries, RIPMessageEntry{
+			Cost:        cost,
+			NetworkAddr: networkAddr,
+			Mask:        mask,
+		})
+	}
+	return RIPMessage{
+		Command:    cmdT,
+		NumEntries: numEntries,
+		Entries:    entries,
+	}
+}
+
 // Given entry bytes, create a rip packet out of it
 func CreateRIPPacketPayload(entryBytes []byte) ([]byte, error) {
 	reqMsg := RIPMessage{
@@ -194,15 +235,123 @@ func CreateRIPPacketPayload(entryBytes []byte) ([]byte, error) {
 	return buf.Bytes(), nil
 }
 
+// Function that checks the routing table entries every 1 second to
+// make sure they are all up-to-date
+func RefreshTable() {
+
+	ticker := time.NewTicker(1 * time.Second)
+
+	for range ticker.C {
+		rtMtx.Lock()
+		for _, ent := range RoutingTable.entries {
+			// Local or Static Routes are immutable
+			if ent.EntryType == util.HOP_LOCAL || ent.EntryType == util.HOP_STATIC {
+				continue
+			}
+			now := time.Now()
+			diff := now.Sub(ent.UpdatedAt)
+			if diff.Seconds() >= 12 {
+				// entry expired! remove
+				delete(RoutingTable.entries, ent.Prefix)
+				// trigger the update
+				ent.Expired = true
+				updateChan <- ent
+			}
+		}
+		rtMtx.Unlock()
+	}
+}
+
+// Process a single RIP entry
+// 3 cases
+// - New Destination
+//   - announcedPrefix is unknown -> ADD
+//
+// - Lower Cost
+//   - annourcedPrefix is known but the announced cost is lower -> Update
+//
+// - NextHop Cost Increase
+//   - announcedPrefix is known and it is from the nexthop -> Update
+func ProcessRIPEntry(announcedPrefix netip.Prefix, cost uint32, from netip.Addr) {
+	rtMtx.Lock()
+	defer rtMtx.Unlock()
+	// Check if we have this prefix
+	ent, ok := RoutingTable.entries[announcedPrefix]
+
+	if !ok {
+		// Unknown prefix
+		if cost == INF {
+			// But if cost is INF, skip
+			return
+		}
+		// OW, add
+		newEnt := NextHop{
+			Prefix:         announcedPrefix,
+			NextHopVIPAddr: from,
+			HopCost:        cost + 1,
+			EntryType:      util.HOP_RIP,
+			Expired:        false,
+			UpdatedAt:      time.Now(),
+		}
+		RoutingTable.entries[announcedPrefix] = newEnt
+		updateChan <- newEnt
+	} else {
+		newCost := cost + 1
+		// Known prefix
+		if ent.EntryType == util.HOP_LOCAL ||
+			ent.EntryType == util.HOP_STATIC {
+			// Local or Static Routes are Immutable
+			return
+		}
+		if ent.NextHopVIPAddr == from {
+			// If coming from same nexthop
+			if newCost >= INF {
+				// If cost is INF (link is down)
+				delete(RoutingTable.entries, announcedPrefix)
+				ent.Expired = true
+				updateChan <- ent
+				return
+			}
+			if newCost == ent.HopCost {
+				// Same hop, same cost, just update
+				ent.UpdatedAt = time.Now()
+				return
+			} else {
+				// Update to whatever the advertised cost is
+				ent.UpdatedAt = time.Now()
+				ent.HopCost = newCost
+				RoutingTable.entries[announcedPrefix] = ent
+				updateChan <- ent
+				return
+			}
+		} else {
+			// If coming from different router
+			if newCost >= ent.HopCost {
+				// Not upgrade worthy
+				return
+			}
+			// Lower cost
+			ent.HopCost = newCost
+			ent.NextHopVIPAddr = from
+			ent.UpdatedAt = time.Now()
+			RoutingTable.entries[announcedPrefix] = ent
+			updateChan <- ent
+			return 
+		}
+	}
+}
+
 // RIP protocol (200)
 func HandleRIPProtocol(packet *packet.Packet) {
-	var b strings.Builder
-	b.WriteString("Received rip packet\n")
-	b.WriteString("--------------------\n")
-	b.WriteString(fmt.Sprintf("Src: %s\n", packet.IPHeader.Src.String()))
-	b.WriteString(fmt.Sprintf("Dst: %s\n", packet.IPHeader.Dst.String()))
-	b.WriteString(fmt.Sprintf("TTL: %d\n", packet.IPHeader.TTL))
-	// b.WriteString(fmt.Sprintf("Data: %s\n", string(packet.Payload)))
-	b.WriteString("--------------------\n")
-	fmt.Printf("\n%s> ", b.String())
+	ripMessage := UnMarshalRIPBytes(packet.Payload)
+	for _, ent := range ripMessage.Entries {
+		// Apply mask
+		NetworkPrefixInt := ent.NetworkAddr & ent.Mask
+		// Convert to netip.Addr
+		NetworkAddr, _ := netip.AddrFromSlice(util.Int2ip(NetworkPrefixInt))
+		numSet := util.NumOfSetBits(ent.Mask)
+		// Convert to netip.Prefix
+		announcedPrefix := netip.PrefixFrom(NetworkAddr, int(numSet))
+		ProcessRIPEntry(announcedPrefix, ent.Cost, packet.IPHeader.Src)
+	}
 }

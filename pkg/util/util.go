@@ -2,16 +2,19 @@ package util
 
 import (
 	"fmt"
+	"net"
 	"net/netip"
 	"strings"
+
+	"github.com/praserx/ipconv"
 )
 
 const (
 	INITIAL_SETUP_TO = 500
-	MAX_PACKET_SIZE = 1400
-	TEST_PROTO = 0
-	ICMP_PROTO = 1
-	RIP_PROTO = 200
+	MAX_PACKET_SIZE  = 1400
+	TEST_PROTO       = 0
+	ICMP_PROTO       = 1
+	RIP_PROTO        = 200
 )
 
 type HopType int
@@ -21,6 +24,10 @@ const (
 	HOP_LOCAL
 	HOP_STATIC
 )
+
+func Int2ip(nn uint32) net.IP {
+	return ipconv.IntToIPv4(nn)
+}
 
 // Given an int, convert to a binary string
 func FromIntToBitString(v uint8) string {
@@ -35,6 +42,16 @@ func IPAddrToBitStrting(addr netip.Addr) string {
 		b.WriteString(FromIntToBitString(ipBytes[i]))
 	}
 	return b.String()
+}
+
+// Count number of set bits
+func NumOfSetBits(n uint32) uint32 {
+	var count uint32 = 0
+	for n != 0 {
+		count += n & 1
+		n >>= 1
+	}
+	return count
 }
 
 // Given two netip.Addrs, return the number of shared prefix between down time
