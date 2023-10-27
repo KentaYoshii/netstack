@@ -6,6 +6,7 @@ import (
 	"net/netip"
 	"strings"
 
+	"github.com/google/netstack/tcpip/header"
 	"github.com/praserx/ipconv"
 )
 
@@ -15,6 +16,7 @@ const (
 	TEST_PROTO       = 0
 	ICMP_PROTO       = 1
 	RIP_PROTO        = 200
+	TRACERT_UDP      = 34534
 )
 
 type HopType int
@@ -66,4 +68,17 @@ func GetNumSharedPrefix(a1 netip.Addr, a2 netip.Addr) int {
 		cnt++
 	}
 	return cnt
+}
+
+func ValidateChecksum(b []byte, fromHeader uint16) uint16 {
+	checksum := header.Checksum(b, fromHeader)
+
+	return checksum
+}
+
+func ComputeChecksum(b []byte) uint16 {
+	checksum := header.Checksum(b, 0)
+	checksumInv := checksum ^ 0xffff
+
+	return checksumInv
 }

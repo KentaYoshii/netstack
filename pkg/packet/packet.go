@@ -34,8 +34,8 @@ func SetCheckSumFor(packet *Packet) error {
 }
 
 // Create a new IP packet with the info passed in 
-func CreateNewPacket(payload []byte, sender netip.Addr, dest netip.Addr, proto int) *Packet {
-	header := util.CreateHeaderFrom(payload, sender, dest, proto)
+func CreateNewPacket(payload []byte, sender netip.Addr, dest netip.Addr, proto int, ttl int) *Packet {
+	header := util.CreateHeaderFrom(payload, sender, dest, proto, ttl)
 	return &Packet{
 		IPHeader: header,
 		Payload: payload,

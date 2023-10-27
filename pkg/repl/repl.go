@@ -65,6 +65,7 @@ func (r *Repl) StartREPL() {
 	r.RegisterCommandHandler("info", r.handleInfo)
 	r.RegisterCommandHandler("up", r.handleUp)
 	r.RegisterCommandHandler("down", r.handleDown)
+	r.RegisterCommandHandler("tracert", r.handleTraceRt)
 
 	fmt.Printf("> ")
 	for r.Scanner.Scan() {
@@ -210,7 +211,7 @@ func (r *Repl) handleSend(args []string) string {
 	// Get the payload
 	payloadString := strings.Join(args[2:], " ")
 	if r.HostInfo.IsThisMyPacket(destAddr) {
-		r.HostInfo.ProtocolHandlerMap[0](packet.CreateNewPacket([]byte(payloadString), netip.Addr{}, destAddr, util.TEST_PROTO))
+		r.HostInfo.ProtocolHandlerMap[0](packet.CreateNewPacket([]byte(payloadString), netip.Addr{}, destAddr, util.TEST_PROTO,  util.DEFAULT_TTL))
 		b.WriteString(fmt.Sprintf("Sent %d bytes!\n", len(payloadString)))
 		return b.String()
 	}
@@ -222,7 +223,7 @@ func (r *Repl) handleSend(args []string) string {
 	}
 	// Get the link to send out from
 	link := r.HostInfo.Subnets[r.HostInfo.NameToPrefix[nextHop.InterfaceName]]
-	newPacket := packet.CreateNewPacket([]byte(payloadString), link.IPAddr, destAddr, util.TEST_PROTO)
+	newPacket := packet.CreateNewPacket([]byte(payloadString), link.IPAddr, destAddr, util.TEST_PROTO, util.DEFAULT_TTL)
 
 	if nextHop.EntryType == util.HOP_LOCAL {
 		// LOCAL delivery
@@ -257,12 +258,12 @@ func (r *Repl) handleUp(args []string) string {
 			li.IsUp = true
 
 			// Add back and Trigger Updates about the up status
-			newHop := proto.NextHop {
-				Prefix: prefix,
+			newHop := proto.NextHop{
+				Prefix:         prefix,
 				NextHopVIPAddr: li.IPAddr,
-				HopCost: 0,
-				EntryType: util.HOP_LOCAL,
-				InterfaceName: li.InterfaceName,
+				HopCost:        0,
+				EntryType:      util.HOP_LOCAL,
+				InterfaceName:  li.InterfaceName,
 			}
 
 			proto.RtMtx.Lock()
@@ -302,12 +303,12 @@ func (r *Repl) handleDown(args []string) string {
 			proto.RtMtx.Unlock()
 
 			// Trigger Updates about the down status
-			newHop := proto.NextHop {
-				Prefix: prefix,
+			newHop := proto.NextHop{
+				Prefix:         prefix,
 				NextHopVIPAddr: li.IPAddr,
-				HopCost: proto.INF,
-				EntryType: util.HOP_LOCAL,
-				InterfaceName: li.InterfaceName,
+				HopCost:        proto.INF,
+				EntryType:      util.HOP_LOCAL,
+				InterfaceName:  li.InterfaceName,
 			}
 			for _, triChan := range r.HostInfo.TriggerChans {
 				triChan <- newHop
@@ -316,5 +317,34 @@ func (r *Repl) handleDown(args []string) string {
 		}
 	}
 	b.WriteString(target + " not found\n")
+	return b.String()
+}
+
+// Handle "tracert" command
+func (r *Repl) handleTraceRt(args []string) string {
+	var b strings.Builder
+	if len(args) != 2 {
+		b.WriteString("Usage: tracert <ip address>\n")
+		return b.String()
+	}
+	destAddr, err := netip.ParseAddr(args[1])
+	if err != nil {
+		b.WriteString(err.Error())
+		return b.String()
+	}
+	b.WriteString(fmt.Sprintf("traceroute to %s, %d hops max\n", destAddr.String(), proto.INF))
+	res := make(chan netip.Addr, 100)
+	for i := 1; i < proto.INF; i++ {
+		go r.HostInfo.TraceRoute(i, destAddr, res)
+		addr := <- res
+		if addr.IsValid() {
+			b.WriteString(fmt.Sprintf("%d    %s\n", i, addr.String()))
+			if addr == destAddr {
+				return b.String()
+			}
+		} else {
+			b.WriteString(fmt.Sprintf("%d    *\n", i))
+		}
+	}
 	return b.String()
 }

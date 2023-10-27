@@ -9,12 +9,11 @@ import (
 	"errors"
 	"fmt"
 	"net/netip"
-
-	"github.com/google/netstack/tcpip/header"
 )
 
 const (
 	Version   = 4  // protocol version
+	DEFAULT_TTL = 16
 	HeaderLen = 20 // header length without extension headers
 )
 
@@ -51,7 +50,7 @@ type IPv4Header struct {
 	Options  []byte      // options, extension headers
 }
 
-func CreateHeaderFrom(payload []byte, sender netip.Addr, dest netip.Addr, proto int) *IPv4Header {
+func CreateHeaderFrom(payload []byte, sender netip.Addr, dest netip.Addr, proto int, ttl int) *IPv4Header {
 	return &IPv4Header{
 		Version: Version,
 		Len: HeaderLen,
@@ -60,7 +59,7 @@ func CreateHeaderFrom(payload []byte, sender netip.Addr, dest netip.Addr, proto 
 		ID: 0,
 		Flags: DontFragment,
 		FragOff: 0,
-		TTL: 16,
+		TTL: ttl,
 		Protocol: proto,
 		Checksum: 0,
 		Src: sender,
@@ -184,17 +183,4 @@ func ParseHeader(b []byte) (*IPv4Header, error) {
 		return nil, err
 	}
 	return h, nil
-}
-
-func ValidateChecksum(b []byte, fromHeader uint16) uint16 {
-	checksum := header.Checksum(b, fromHeader)
-
-	return checksum
-}
-
-func ComputeChecksum(b []byte) uint16 {
-	checksum := header.Checksum(b, 0)
-	checksumInv := checksum ^ 0xffff
-
-	return checksumInv
 }

@@ -60,14 +60,10 @@ func (li *Link) arpLookup(dst netip.Addr) (netip.AddrPort, bool) {
 // Given payload, destination IP address and IP Header, send the packet to the
 // MAC Address corresponding to the passed in IP Address
 func (li *Link) SendLocal(packet *packet.Packet, dst netip.Addr, f bool) error {
-	// Check the state of the link
-	if !li.IsUp {
-		return errors.New("link is down\n")
-	}
 	// ARP look up
 	dstMACAddr, found := li.arpLookup(dst)
 	if !found {
-		return errors.New("mac address not found\n")
+		return errors.New("ARP")
 	}
 	// Decrement the Time To Live (SHOULD NOT reach 0) if for forward
 	if f {
@@ -101,8 +97,8 @@ func (li *Link) ListenAtInterface(packetChan chan *packet.Packet, errorChan chan
 			errorChan <- err.Error()
 			continue
 		}
-		// Check Link State
 		if !li.IsUp {
+			// Don't recv
 			continue
 		}
 		header, err := util.ParseHeader(buf)
@@ -126,6 +122,19 @@ func (li *Link) ListenAtInterface(packetChan chan *packet.Packet, errorChan chan
 	}
 }
 
+func (li *Link) CreateICMPPacketTo(icType uint8, icCode uint8, pac *packet.Packet) (*packet.Packet, error) {
+	icmpPacket, err := proto.CreateICMPPacketFrom(pac, icType, icCode)
+	if err != nil {
+		return &packet.Packet{}, err
+	}
+	icmpBytes, err := icmpPacket.Marshal()
+	if err != nil {
+		return &packet.Packet{}, err
+	}
+	newPacket := packet.CreateNewPacket(icmpBytes, li.IPAddr, pac.IPHeader.Src, util.ICMP_PROTO, util.DEFAULT_TTL)
+	return newPacket, nil
+}
+
 // Function to send a request for routes message to the "neighbor"
 func (li *Link) RequestRouteFrom(neighbor netip.Addr) {
 	// Create the Payload for RIP Request Message
@@ -135,7 +144,7 @@ func (li *Link) RequestRouteFrom(neighbor netip.Addr) {
 		return
 	}
 	// Create the packet
-	packet := packet.CreateNewPacket(payload, li.IPAddr, neighbor, util.RIP_PROTO)
+	packet := packet.CreateNewPacket(payload, li.IPAddr, neighbor, util.RIP_PROTO, util.DEFAULT_TTL)
 	// Send to the neighbor router
 	err = li.SendLocal(packet, neighbor, false)
 	if err != nil {
@@ -166,7 +175,7 @@ func (li *Link) TriggerUpdateTo(neighbor netip.Addr, newEntry proto.NextHop) {
 		li.ErrorChan <- err.Error()
 		return
 	}
-	packet := packet.CreateNewPacket(ripBytes, li.IPAddr, neighbor, util.RIP_PROTO)
+	packet := packet.CreateNewPacket(ripBytes, li.IPAddr, neighbor, util.RIP_PROTO, util.DEFAULT_TTL)
 	// Send to the neighbor router
 	err = li.SendLocal(packet, neighbor, false)
 	if err != nil {
@@ -174,7 +183,6 @@ func (li *Link) TriggerUpdateTo(neighbor netip.Addr, newEntry proto.NextHop) {
 		return
 	}
 }
-
 
 // Function that periodically updates the neighbor with its routes every 5 seconds
 // If trigger update, then send the new entry
@@ -184,7 +192,8 @@ func (li *Link) SendUpdatesTo(neighbor netip.Addr, triggerChan chan proto.NextHo
 
 	for {
 		select {
-		case <- ticker.C: {
+		case <-ticker.C:
+			{
 				// Get Current Entries
 				nextHopEntries := proto.GetAllEntries()
 				// Apply Poison Reverse
@@ -197,13 +206,15 @@ func (li *Link) SendUpdatesTo(neighbor netip.Addr, triggerChan chan proto.NextHo
 				entBytes, err := proto.MarshalRIPEntries(ripEntries)
 				if err != nil {
 					li.ErrorChan <- err.Error()
+					continue
 				}
 				// Create the rip packet
 				ripBytes, err := proto.CreateRIPPacketPayload(entBytes)
 				if err != nil {
 					li.ErrorChan <- err.Error()
+					continue
 				}
-				packet := packet.CreateNewPacket(ripBytes, li.IPAddr, neighbor, util.RIP_PROTO)
+				packet := packet.CreateNewPacket(ripBytes, li.IPAddr, neighbor, util.RIP_PROTO, util.DEFAULT_TTL)
 				// Send to the neighbor router
 				err = li.SendLocal(packet, neighbor, false)
 				if err != nil {
@@ -211,10 +222,11 @@ func (li *Link) SendUpdatesTo(neighbor netip.Addr, triggerChan chan proto.NextHo
 					continue
 				}
 			}
-		case update := <- triggerChan: {
-			// Trigger Update!
-			li.TriggerUpdateTo(neighbor, update)
+		case update := <-triggerChan:
+			{
+				// Trigger Update!
+				li.TriggerUpdateTo(neighbor, update)
+			}
 		}
-		}
-	} 
+	}
 }
