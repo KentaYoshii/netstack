@@ -125,6 +125,9 @@ func (li *Link) ListenAtInterface(packetChan chan *packet.Packet, errorChan chan
 	}
 }
 
+// Given ICMP Type "icType", Type code "icCode", and invalid packet "pac"
+// Create and return an ICMP packet to be sent back to the source of the
+// invalid IP packet
 func (li *Link) CreateICMPPacketTo(icType uint8, icCode uint8, pac *packet.Packet) (*packet.Packet, error) {
 	icmpPacket, err := proto.CreateICMPPacketFrom(pac, icType, icCode)
 	if err != nil {
@@ -191,7 +194,7 @@ func (li *Link) TriggerUpdateTo(neighbor netip.Addr, newEntry proto.NextHop) {
 // If trigger update, then send the new entry
 func (li *Link) SendUpdatesTo(neighbor netip.Addr, triggerChan chan proto.NextHop) {
 
-	ticker := time.NewTicker(5 * time.Second)
+	ticker := time.NewTicker(proto.PERIODIC_TO * time.Second)
 
 	for {
 		select {

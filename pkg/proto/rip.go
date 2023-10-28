@@ -13,6 +13,7 @@ import (
 
 const (
 	REFRESH_RATE = 1
+	PERIODIC_TO = 5
 	RT_ENT_TO = 12
 	RIP_ENTRY_SIZE = 12
 	REQUEST_CMD  = 1
