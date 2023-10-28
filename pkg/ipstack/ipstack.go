@@ -1,8 +1,8 @@
 package ipstack
 
 import (
-	"bufio"
 	"errors"
+	"log/slog"
 	"net/netip"
 	"netstack/pkg/link"
 	"netstack/pkg/packet"
@@ -13,12 +13,12 @@ import (
 	"time"
 )
 
-type ProtocolHandler func(*packet.Packet)
+type ProtocolHandler func(*packet.Packet, *slog.Logger)
 
 type IpStack struct {
 
-	// Writer
-	Writer *bufio.Writer
+	// Logger
+	Logger *slog.Logger
 
 	// RIP enabled?
 	RipEnabled bool
@@ -56,7 +56,11 @@ type IpStack struct {
 // Create new IP stack
 func CreateIPStack() *IpStack {
 	return &IpStack{
-		Writer:             bufio.NewWriter(os.Stdout),
+		Logger: slog.New(util.NewPrettyHandler(os.Stdout, util.PrettyHandlerOptions{
+			SlogOpts: slog.HandlerOptions{
+				Level: slog.LevelDebug,
+			},
+		})),
 		RipEnabled:         false,
 		Subnets:            make(map[netip.Prefix]*link.Link),
 		ProtocolHandlerMap: make(map[uint8]ProtocolHandler),
@@ -242,7 +246,7 @@ func (ip *IpStack) SendEchoRequest(ttl int, to netip.Addr) (int, int) {
 	return id, seq
 }
 
-// Function that sends an ICMP Packet with type "t" and code "c" 
+// Function that sends an ICMP Packet with type "t" and code "c"
 // in response to invalid packet "packet"
 func (ip *IpStack) SendICMP(packet *packet.Packet, t uint8, c uint8) {
 	// Get outgoing link
@@ -273,7 +277,7 @@ func (ip *IpStack) SendPacket(packet *packet.Packet, f bool) error {
 	// Get the next hop
 	nextHop, found := ip.GetNextHop(packet.IPHeader.Dst)
 	if !found {
-		return errors.New("next hop not found")
+		return errors.New("Next Hop for" + packet.IPHeader.Dst.String() + " not found")
 	}
 	// Get the link to send out from
 	link := ip.Subnets[ip.NameToPrefix[nextHop.InterfaceName]]
@@ -300,7 +304,7 @@ func (ip *IpStack) ProcessPackets() {
 					ip.SendICMP(packet, proto.DST_UNREACHABLE, proto.DST_UNREACHABLE_PROTO)
 				} else {
 					// Send up
-					handler(packet)
+					handler(packet, ip.Logger)
 					if packet.IPHeader.Protocol == util.ICMP_PROTO {
 						// Separately process ICMP
 						icmpPacket := proto.UnMarshalICMPPacket(packet.Payload)
@@ -326,11 +330,9 @@ func (ip *IpStack) ProcessPackets() {
 				ip.SendICMP(packet, proto.DST_UNREACHABLE_NETWORK, proto.DST_UNREACHABLE_NETWORK)
 			}
 		case errString := <-ip.errorChan:
-			ip.Writer.WriteString("\nError: " + errString + "\n> ")
-			ip.Writer.Flush()
+			ip.Logger.Warn(errString)
 		case info := <-ip.InfoChan:
-			ip.Writer.WriteString("\nInfo: " + info + "\n> ")
-			ip.Writer.Flush()
+			ip.Logger.Info(info)
 		}
 	}
 }
@@ -411,9 +413,9 @@ func (ip *IpStack) TraceRoute(ttl int, to netip.Addr, res chan proto.TraceRouteI
 					continue
 				}
 				// Valid
-				res <- proto.TraceRouteInfo {
+				res <- proto.TraceRouteInfo{
 					IPAddr: pac.IPHeader.Src,
-					RTT: end.Sub(start),
+					RTT:    end.Sub(start),
 				}
 				return
 			}
@@ -430,7 +432,7 @@ func (ip *IpStack) TraceRoute(ttl int, to netip.Addr, res chan proto.TraceRouteI
 }
 
 // Pings the given ip
-// - send ICMP Echo Request to "to" 
+// - send ICMP Echo Request to "to"
 // - wait until we receive ICMP ECHO_REPLY
 func (ip *IpStack) Ping(to netip.Addr, res chan proto.PingInfo) {
 	// Send Echo Request
@@ -446,7 +448,7 @@ func (ip *IpStack) Ping(to netip.Addr, res chan proto.PingInfo) {
 				end := time.Now()
 				icmpPacket := proto.UnMarshalICMPPacket(pac.Payload)
 				// Not Echo Reply
-				if (icmpPacket.ICMPHeader.Type != proto.ECHO_REPLY) {
+				if icmpPacket.ICMPHeader.Type != proto.ECHO_REPLY {
 					continue
 				}
 				// ECHO REPLY
@@ -457,11 +459,11 @@ func (ip *IpStack) Ping(to netip.Addr, res chan proto.PingInfo) {
 					continue
 				}
 				// Valid
-				res <- proto.PingInfo {
-					From: pac.IPHeader.Src,
-					RTT: end.Sub(start),
-					SEQ: seq,
-					TTL: pac.IPHeader.TTL,
+				res <- proto.PingInfo{
+					From:     pac.IPHeader.Src,
+					RTT:      end.Sub(start),
+					SEQ:      seq,
+					TTL:      pac.IPHeader.TTL,
 					NumBytes: pac.IPHeader.Len,
 				}
 				return
@@ -485,16 +487,16 @@ func (ip *IpStack) Ping(to netip.Addr, res chan proto.PingInfo) {
 func (ip *IpStack) GetOutgoingLink(dst netip.Addr) (*link.Link, bool) {
 	nextHop, found := ip.GetNextHop(dst)
 	if !found {
-		ip.errorChan <- "no nexthop for icmp\n"
+		ip.errorChan <- "NextHop for " + dst.String() + " not found"
 		return &link.Link{}, false
 	}
 	li, ok := ip.Subnets[ip.NameToPrefix[nextHop.InterfaceName]]
 	if !ok {
-		ip.errorChan <- "if not found\n"
+		ip.errorChan <- "Interface name " + nextHop.InterfaceName + " not found"
 		return &link.Link{}, false
 	}
 	if !li.IsUp {
-		ip.errorChan <- "icmp cannot be sent from downed link\n"
+		ip.errorChan <- "Packet cannot be sent from downed " + li.InterfaceName + "."
 		return &link.Link{}, false
 	}
 	return li, true

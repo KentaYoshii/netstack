@@ -7,6 +7,7 @@ import (
 	"net/netip"
 	"netstack/pkg/packet"
 	"netstack/pkg/util"
+	"log/slog"
 	"sync"
 	"time"
 )
@@ -355,7 +356,7 @@ func ProcessRIPEntry(announcedPrefix netip.Prefix, cost uint32, from netip.Addr)
 // - For each entry in the message
 //   - Check if the entry deserves to be added to our routing table
 //     - if yes -> let the ip stack know about the new route
-func HandleRIPProtocol(packet *packet.Packet) {
+func HandleRIPProtocol(packet *packet.Packet, l *slog.Logger) {
 	ripMessage := UnMarshalRIPBytes(packet.Payload)
 	for _, ent := range ripMessage.Entries {
 		// Apply mask

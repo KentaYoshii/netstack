@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding/binary"
 	"errors"
+	"log/slog"
 	"math/rand"
 	"net/netip"
 	"netstack/pkg/packet"
@@ -41,15 +42,15 @@ const (
 type TraceRouteInfo struct {
 	// trace route information
 	IPAddr netip.Addr
-	RTT time.Duration
+	RTT    time.Duration
 }
 
 type PingInfo struct {
 	// ping information
-	From netip.Addr
-	RTT time.Duration
-	TTL int
-	SEQ int
+	From     netip.Addr
+	RTT      time.Duration
+	TTL      int
+	SEQ      int
 	NumBytes int
 }
 
@@ -142,9 +143,9 @@ func CreateICMPPacketFrom(packet *packet.Packet, t uint8, c uint8) (*ICMPPacket,
 		return &ICMPPacket{}, err
 	}
 	// Checksum
-	// Computed over 
+	// Computed over
 	// - ICMP header,
-	// - IP header, 
+	// - IP header,
 	// - First 8 bytes of original datagram data
 	allbuf.Write(hdrBytes)
 	allbuf.Write(iphdrBytes)
@@ -152,7 +153,7 @@ func CreateICMPPacketFrom(packet *packet.Packet, t uint8, c uint8) (*ICMPPacket,
 	newCheckSum := util.ComputeChecksum(allbuf.Bytes())
 	hdr.Checksum = newCheckSum
 	// Payload
-	// - IP Header 
+	// - IP Header
 	// - First 8 bytes of original datagram data
 	payloadbuf.Write(iphdrBytes)
 	payloadbuf.Write(packet.Payload[:8])
@@ -245,6 +246,19 @@ func UnmarshalICMPHeader(b []byte) *ICMPHeader {
 	}
 }
 
-func HandleICMPProtocol(packet *packet.Packet) {
-
+func HandleICMPProtocol(packet *packet.Packet, l *slog.Logger) {
+	var typeString string
+	icmpPacket := UnMarshalICMPPacket(packet.Payload)
+	if icmpPacket.ICMPHeader.Type == DST_UNREACHABLE {
+		typeString = "DESTINATION_UNREACHABLE"
+	} else if icmpPacket.ICMPHeader.Type == TIME_EXCEEDED {
+		typeString = "TIME_EXCEEDED"
+	} else if icmpPacket.ICMPHeader.Type == ECHO_REQUEST {
+		typeString = "ECHO_REQUEST"
+	} else if icmpPacket.ICMPHeader.Type == ECHO_REPLY {
+		typeString = "ECHO_REPLY"
+	} else {
+		typeString = string(icmpPacket.ICMPHeader.Type)
+	}
+	l.Debug("Recieved ICMP Packet " + typeString + " from " + packet.IPHeader.Src.String())
 }

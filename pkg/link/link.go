@@ -62,12 +62,12 @@ func (li *Link) arpLookup(dst netip.Addr) (netip.AddrPort, bool) {
 // MAC Address corresponding to the passed in IP Address
 func (li *Link) SendLocal(packet *packet.Packet, dst netip.Addr, f bool) error {
 	if !li.IsUp {
-		return errors.New("link is down")
+		return errors.New("Packet cannot be sent from downed " + li.InterfaceName)
 	}
 	// ARP look up
 	dstMACAddr, found := li.arpLookup(dst)
 	if !found {
-		return errors.New("ARP")
+		return errors.New("MAC Address resolution failed for IP: " + dst.String())
 	}
 	// Decrement the Time To Live (SHOULD NOT reach 0) if for forward
 	if f {
@@ -115,7 +115,7 @@ func (li *Link) ListenAtInterface(packetChan chan *packet.Packet, errorChan chan
 		originalCheckSum := uint16(header.Checksum)
 		computedCheckSum := util.ValidateChecksum(headerBytes, originalCheckSum)
 		if originalCheckSum != computedCheckSum {
-			errorChan <- "Checksum is wrong! Dropping this packet!\n"
+			errorChan <- "Checksum is wrong! Dropping this packet!"
 			continue
 		}
 		// Checksum ok so send the packet to the channel

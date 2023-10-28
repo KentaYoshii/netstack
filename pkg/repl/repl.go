@@ -47,7 +47,7 @@ func (r *Repl) RegisterCommandHandler(command string, handler ReplHandler) {
 
 // Helper function to write a result
 func (r *Repl) WriteOutput(output string, prompt bool) {
-	r.Writer.WriteString(output)
+	r.Writer.WriteString(output + "\n")
 	if prompt {
 		r.Writer.WriteString(PROMPT)
 	}
@@ -69,12 +69,11 @@ func (r *Repl) StartREPL() {
 	r.RegisterCommandHandler("tracert", r.handleTraceRt)
 	r.RegisterCommandHandler("ping", r.handlePing)
 
-	fmt.Printf("> ")
 	for r.Scanner.Scan() {
 		// Split
 		tokens := strings.Fields(r.Scanner.Text())
 		if len(tokens) == 0 {
-			r.WriteOutput("", true)
+			r.WriteOutput("", false)
 			continue
 		}
 		if tokens[0] == "exit" {
@@ -84,11 +83,11 @@ func (r *Repl) StartREPL() {
 		handler, ok := r.CommandHandlerMap[tokens[0]]
 		if !ok {
 			// No handler
-			r.WriteOutput("Command not supported. Type help to see the supported commands\n", true)
+			r.WriteOutput("Command not supported. Type help to see the supported commands\n", false)
 			continue
 		}
 		// Handle
-		r.WriteOutput(handler(tokens), true)
+		r.WriteOutput(handler(tokens), false)
 	}
 	if e := r.Scanner.Err(); e != nil {
 		r.WriteOutput("Host REPL terminating...\n", false)
