@@ -190,6 +190,7 @@ class Node():
                     print(f"Warning:  multiple routers found for host {self.name}, selecting one")
                 default_router, default_iface = routers[0]
                 default_ip, _ = default_router.get_ip_on_network(default_iface.network)
+                fd.write("routing static\n\n")
                 fd.write("# Default route\n")
                 fd.write("route 0.0.0.0/0 via {}\n".format(default_ip))
             else:

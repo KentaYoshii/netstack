@@ -165,15 +165,15 @@ def main(input_args):
     if args.bin_config:
         bin_info = BinManager.from_bin_config(args.bin_config)
     else:
-        if args.bin_dir:
-            host_bin = pathlib.Path(args.bin_dir).resolve() / VHOST_BINARY_NAME
-            router_bin = pathlib.Path(args.bin_dir).resolve() / VROUTER_BINARY_NAME
-        else:
+        if (args.router != "") or (args.host != ""):
             if args.router == "" or args.host == "":
                 do_exit("Must specify host and router binaries with --bin-dir or (--host and --router)")
 
             router_bin = pathlib.Path(args.router).resolve()
             host_bin = pathlib.Path(args.host).resolve()
+        else:
+            host_bin = pathlib.Path(args.bin_dir).resolve() / VHOST_BINARY_NAME
+            router_bin = pathlib.Path(args.bin_dir).resolve() / VROUTER_BINARY_NAME
 
         check_bin_exists(router_bin)
         check_bin_exists(host_bin)
