@@ -41,6 +41,7 @@ func (li *Link) InitializeLink() error {
 		return err
 	}
 	li.ListenConn = conn
+	li.ARPTable[li.IPAddr] = li.ListenAddr
 	return nil
 }
 

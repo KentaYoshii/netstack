@@ -378,15 +378,18 @@ func (ip *IpStack) CheckForRouteUpdates() {
 // - wait until we receive ICMP TIME_EXCEEDED or ICMP ECHO_REPLY
 //   - TIME_EXCEEDED -> mid way
 //   - ECHO_REPLY -> successfully reach the destination
-func (ip *IpStack) TraceRoute(ttl int, to netip.Addr, res chan netip.Addr) {
+func (ip *IpStack) TraceRoute(ttl int, to netip.Addr, res chan proto.TraceRouteInfo) {
 	// Send Echo Request
 	id, seq := ip.SendEchoRequest(ttl, to)
+	// Measure RTT
+	start := time.Now()
 	// Wait for ICMP or timeout
 	timer := time.NewTimer(1 * time.Second)
 	for {
 		select {
 		case pac := <-ip.ICMPChan:
 			{
+				end := time.Now()
 				icmpPacket := proto.UnMarshalICMPPacket(pac.Payload)
 				// Not Echo Reply or TTL Exceeded
 				if (icmpPacket.ICMPHeader.Type != proto.ECHO_REPLY) &&
@@ -408,13 +411,67 @@ func (ip *IpStack) TraceRoute(ttl int, to netip.Addr, res chan netip.Addr) {
 					continue
 				}
 				// Valid
-				res <- pac.IPHeader.Src
+				res <- proto.TraceRouteInfo {
+					IPAddr: pac.IPHeader.Src,
+					RTT: end.Sub(start),
+				}
 				return
 			}
 		case <-timer.C:
 			{
 				// Time is up
-				res <- netip.Addr{}
+				res <- proto.TraceRouteInfo{
+					IPAddr: netip.Addr{},
+				}
+				return
+			}
+		}
+	}
+}
+
+// Pings the given ip
+// - send ICMP Echo Request to "to" 
+// - wait until we receive ICMP ECHO_REPLY
+func (ip *IpStack) Ping(to netip.Addr, res chan proto.PingInfo) {
+	// Send Echo Request
+	id, seq := ip.SendEchoRequest(util.DEFAULT_TTL, to)
+	// Measure RTT
+	start := time.Now()
+	// Wait for ICMP or timeout
+	timer := time.NewTimer(1 * time.Second)
+	for {
+		select {
+		case pac := <-ip.ICMPChan:
+			{
+				end := time.Now()
+				icmpPacket := proto.UnMarshalICMPPacket(pac.Payload)
+				// Not Echo Reply
+				if (icmpPacket.ICMPHeader.Type != proto.ECHO_REPLY) {
+					continue
+				}
+				// ECHO REPLY
+				payload := icmpPacket.ICMPHeader.Data[:]
+				matchID, matchSEQ := util.ExtractIdSeq(payload)
+				if matchID != uint16(id) || matchSEQ != uint16(seq) {
+					// No match
+					continue
+				}
+				// Valid
+				res <- proto.PingInfo {
+					From: pac.IPHeader.Src,
+					RTT: end.Sub(start),
+					SEQ: seq,
+					TTL: pac.IPHeader.TTL,
+					NumBytes: pac.IPHeader.Len,
+				}
+				return
+			}
+		case <-timer.C:
+			{
+				// Time is up
+				res <- proto.PingInfo{
+					From: netip.Addr{},
+				}
 				return
 			}
 		}

@@ -5,8 +5,10 @@ import (
 	"encoding/binary"
 	"errors"
 	"math/rand"
+	"net/netip"
 	"netstack/pkg/packet"
 	"netstack/pkg/util"
+	"time"
 )
 
 const (
@@ -35,6 +37,21 @@ const (
 	TIME_EXCEEDED_TTL  = 0
 	TIME_EXCEEDED_FRAG = 1
 )
+
+type TraceRouteInfo struct {
+	// trace route information
+	IPAddr netip.Addr
+	RTT time.Duration
+}
+
+type PingInfo struct {
+	// ping information
+	From netip.Addr
+	RTT time.Duration
+	TTL int
+	SEQ int
+	NumBytes int
+}
 
 type ICMPPacket struct {
 	// ICMP Message struct

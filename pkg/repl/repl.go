@@ -9,6 +9,7 @@ import (
 	"netstack/pkg/proto"
 	"netstack/pkg/util"
 	"os"
+	"strconv"
 	"strings"
 )
 
@@ -66,6 +67,7 @@ func (r *Repl) StartREPL() {
 	r.RegisterCommandHandler("up", r.handleUp)
 	r.RegisterCommandHandler("down", r.handleDown)
 	r.RegisterCommandHandler("tracert", r.handleTraceRt)
+	r.RegisterCommandHandler("ping", r.handlePing)
 
 	fmt.Printf("> ")
 	for r.Scanner.Scan() {
@@ -192,6 +194,8 @@ func (r *Repl) handleHelp(args []string) string {
 	b.WriteString(fmt.Sprintf("%-6s %-15s\n", "down", "Disable an interface"))
 	b.WriteString(fmt.Sprintf("%-6s %-15s\n", "send", "Send test packet"))
 	b.WriteString(fmt.Sprintf("%-6s %-15s\n", "tracert", "Traceroute to given ip"))
+	b.WriteString(fmt.Sprintf("%-6s %-15s\n", "ping", "Ping the given ip"))
+
 	return b.String()
 }
 
@@ -209,12 +213,6 @@ func (r *Repl) handleSend(args []string) string {
 	}
 	// Get the payload
 	payloadString := strings.Join(args[2:], " ")
-	if r.HostInfo.IsThisMyPacket(destAddr) {
-		r.HostInfo.ProtocolHandlerMap[0](packet.CreateNewPacket([]byte(payloadString), netip.Addr{}, destAddr, util.TEST_PROTO,  util.DEFAULT_TTL))
-		b.WriteString(fmt.Sprintf("Sent %d bytes!\n", len(payloadString)))
-		return b.String()
-	}
-
 	link, valid := r.HostInfo.GetOutgoingLink(destAddr)
 	if !valid {
 		return b.String()
@@ -321,19 +319,66 @@ func (r *Repl) handleTraceRt(args []string) string {
 		b.WriteString(err.Error())
 		return b.String()
 	}
-	b.WriteString(fmt.Sprintf("traceroute to %s, %d hops max\n", destAddr.String(), proto.INF))
-	res := make(chan netip.Addr, 100)
+	b.WriteString(fmt.Sprintf("traceroute to %s, %d hops max, 4 bytes packet\n", destAddr.String(), proto.INF))
+	res := make(chan proto.TraceRouteInfo, 100)
 	for i := 1; i < proto.INF; i++ {
 		go r.HostInfo.TraceRoute(i, destAddr, res)
-		addr := <- res
-		if addr.IsValid() {
-			b.WriteString(fmt.Sprintf("%d    %s\n", i, addr.String()))
-			if addr == destAddr {
+		trInfo := <-res
+		if trInfo.IPAddr.IsValid() {
+			b.WriteString(fmt.Sprintf("%d    %s   %d micro seconds\n",
+				i, trInfo.IPAddr.String(), trInfo.RTT.Microseconds()))
+			if trInfo.IPAddr == destAddr {
 				return b.String()
 			}
 		} else {
 			b.WriteString(fmt.Sprintf("%d    *\n", i))
 		}
 	}
+	return b.String()
+}
+
+// Handle "ping" command
+func (r *Repl) handlePing(args []string) string {
+	var b strings.Builder
+	if len(args) != 3 {
+		b.WriteString("Usage: ping <count> <ip address>\n")
+		return b.String()
+	}
+	cnt, _ := strconv.Atoi(args[1])
+	destAddr, err := netip.ParseAddr(args[2])
+	if err != nil {
+		b.WriteString(err.Error())
+		return b.String()
+	}
+	b.WriteString(fmt.Sprintf("PING %s: 4 data bytes\n", destAddr.String()))
+	res := make(chan proto.PingInfo, 100)
+	okCnt := 0
+	var rttMin, rttMax, rttAvg int64
+	rttMin = 1000000
+	rttMax = 1
+	for i := 0; i < cnt; i++ {
+		go r.HostInfo.Ping(destAddr, res)
+	}
+	for i := 0; i < cnt; i++ {
+		pingInfo := <-res
+		if pingInfo.From.IsValid() {
+			okCnt += 1
+			// Stats
+			rttMin = min(rttMin, pingInfo.RTT.Microseconds())
+			rttMax = max(rttMax, pingInfo.RTT.Microseconds())
+			rttAvg += pingInfo.RTT.Microseconds()
+
+			b.WriteString(fmt.Sprintf("%d bytes from %s: icmp_seq=%d ttl=%d time=%d ms\n",
+				pingInfo.NumBytes, pingInfo.From.String(), pingInfo.SEQ, pingInfo.TTL, pingInfo.RTT.Microseconds()))
+
+		} else {
+			b.WriteString("Request timed out. \n")
+		}
+	}
+	b.WriteString(fmt.Sprintf("--- %s ping statistics ---\n", destAddr.String()))
+	b.WriteString(fmt.Sprintf("%d packets transmitted, %d packets received, %f percent packet loss\n",
+		cnt, okCnt, 100.0-float32(okCnt*100)/float32(cnt)))
+	b.WriteString(fmt.Sprintf("round-trip min/avg/max = %d/%f/%d ms\n",
+		rttMin, float32(rttAvg)/float32(okCnt), rttMax))
 	return b.String()
 }
