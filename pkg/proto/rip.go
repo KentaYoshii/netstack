@@ -12,6 +12,9 @@ import (
 )
 
 const (
+	REFRESH_RATE = 1
+	RT_ENT_TO = 12
+	RIP_ENTRY_SIZE = 12
 	REQUEST_CMD  = 1
 	RESPONSE_CMD = 2
 	INF          = 16
@@ -20,26 +23,32 @@ const (
 type RoutingTableT struct {
 	Entries         map[netip.Prefix]NextHop
 	RouteUpdateChan chan NextHop
+	RtMtx sync.Mutex
 }
 
 type NextHop struct {
-	// For Prefix
+	// Struct that represents our "Next Hop" node
+	// It is contained in the Routing Table and Fowarding Table
+
+	// For This Prefix
 	Prefix netip.Prefix
-	// VIPAddress of our next hop
+	// IPv4 Address of our next hop
 	NextHopVIPAddr netip.Addr
 	// Cost (infinity = 16)
 	HopCost uint32
-	// Type
+	// Type (Local, Static, or RIP)
 	EntryType util.HopType
-	// Interface name
+	// Interface name through which we can reach this Next Hop
 	InterfaceName string
-	// Expired
+	// Flag for expiration
 	Expired bool
-	// Last Update At
+	// Last Updated time of this Next Hop
 	UpdatedAt time.Time
 }
 
 type RIPMessage struct {
+	// RIP Message that gets sent to neighboring routers for Routing Update
+
 	// 1 (Request) or 2 (Response)
 	Command uint16
 	// 0 for Request
@@ -48,6 +57,8 @@ type RIPMessage struct {
 }
 
 type RIPMessageEntry struct {
+	// Struct that represents a single RIP Message Entry
+
 	// Network Address
 	NetworkAddr uint32
 	// Mask
@@ -59,16 +70,11 @@ type RIPMessageEntry struct {
 // Global Routing Table
 var RoutingTable RoutingTableT
 
-// Mutex
-var RtMtx sync.Mutex
-
-// Update Channel
-var updateChan chan NextHop
-
 // Initialize the routing table with immutable local&static routes
 func InitializeRoutingTable(from map[netip.Prefix]NextHop, uchan chan NextHop) {
 	RoutingTable = RoutingTableT{
 		Entries:         make(map[netip.Prefix]NextHop),
+		RouteUpdateChan: uchan,
 	}
 	for prefix, nh := range from {
 		RoutingTable.Entries[prefix] = NextHop{
@@ -79,7 +85,6 @@ func InitializeRoutingTable(from map[netip.Prefix]NextHop, uchan chan NextHop) {
 			InterfaceName:  nh.InterfaceName,
 		}
 	}
-	updateChan = uchan
 	// Start a routine that continually monitors the routing table
 	go RefreshTable()
 }
@@ -105,8 +110,8 @@ func CreateRIPRequestPayload() ([]byte, error) {
 
 // Get all entries from the routing table
 func GetAllEntries() []NextHop {
-	RtMtx.Lock()
-	defer RtMtx.Unlock()
+	RoutingTable.RtMtx.Lock()
+	defer RoutingTable.RtMtx.Unlock()
 
 	entries := make([]NextHop, 0)
 	for _, ent := range RoutingTable.Entries {
@@ -209,11 +214,11 @@ func UnMarshalRIPBytes(b []byte) RIPMessage {
 	}
 }
 
-// Given entry bytes, create a rip packet out of it
+// Given entry bytes, return the whole rip message bytes to be sent to other routes
 func CreateRIPPacketPayload(entryBytes []byte) ([]byte, error) {
 	reqMsg := RIPMessage{
 		Command:    RESPONSE_CMD,
-		NumEntries: uint16(len(entryBytes) / 12),
+		NumEntries: uint16(len(entryBytes) / RIP_ENTRY_SIZE),
 	}
 	buf := new(bytes.Buffer)
 	// CMD type
@@ -234,30 +239,31 @@ func CreateRIPPacketPayload(entryBytes []byte) ([]byte, error) {
 	return buf.Bytes(), nil
 }
 
-// Function that checks the routing table entries every 1 second to
-// make sure they are all up-to-date
+// Checks the routing table entries every REFRESH_RATE second to
+// make sure they are all up-to-date. Delete if any of them are stale
 func RefreshTable() {
 
-	ticker := time.NewTicker(1 * time.Second)
+	ticker := time.NewTicker(REFRESH_RATE * time.Second)
 
 	for range ticker.C {
-		RtMtx.Lock()
+		RoutingTable.RtMtx.Lock()
 		for _, ent := range RoutingTable.Entries {
 			// Local or Static Routes are immutable
 			if ent.EntryType == util.HOP_LOCAL || ent.EntryType == util.HOP_STATIC {
 				continue
 			}
+			// Compute the time difference
 			now := time.Now()
 			diff := now.Sub(ent.UpdatedAt)
-			if diff.Seconds() >= 12 {
+			if diff.Seconds() >= RT_ENT_TO {
 				// entry expired! remove
 				delete(RoutingTable.Entries, ent.Prefix)
 				// trigger the update
 				ent.Expired = true
-				updateChan <- ent
+				RoutingTable.RouteUpdateChan <- ent
 			}
 		}
-		RtMtx.Unlock()
+		RoutingTable.RtMtx.Unlock()
 	}
 }
 
@@ -271,9 +277,11 @@ func RefreshTable() {
 //
 // - NextHop Cost Increase
 //   - announcedPrefix is known and it is from the nexthop -> Update
+// In either case, if we deem the new entry to be worthy of adding, let the ip stack know by sending
+// to the "updateChan"
 func ProcessRIPEntry(announcedPrefix netip.Prefix, cost uint32, from netip.Addr) {
-	RtMtx.Lock()
-	defer RtMtx.Unlock()
+	RoutingTable.RtMtx.Lock()
+	defer RoutingTable.RtMtx.Unlock()
 	// Check if we have this prefix
 	ent, ok := RoutingTable.Entries[announcedPrefix]
 
@@ -283,7 +291,7 @@ func ProcessRIPEntry(announcedPrefix netip.Prefix, cost uint32, from netip.Addr)
 			// But if cost is INF, skip
 			return
 		}
-		// OW, add
+		// O.W., add
 		newEnt := NextHop{
 			Prefix:         announcedPrefix,
 			NextHopVIPAddr: from,
@@ -293,7 +301,7 @@ func ProcessRIPEntry(announcedPrefix netip.Prefix, cost uint32, from netip.Addr)
 			UpdatedAt:      time.Now(),
 		}
 		RoutingTable.Entries[announcedPrefix] = newEnt
-		updateChan <- newEnt
+		RoutingTable.RouteUpdateChan <- newEnt
 	} else {
 		newCost := cost + 1
 		// Known prefix
@@ -308,7 +316,7 @@ func ProcessRIPEntry(announcedPrefix netip.Prefix, cost uint32, from netip.Addr)
 				// If cost is INF (link is down)
 				delete(RoutingTable.Entries, announcedPrefix)
 				ent.Expired = true
-				updateChan <- ent
+				RoutingTable.RouteUpdateChan <- ent
 				return
 			}
 			if newCost == ent.HopCost {
@@ -321,7 +329,7 @@ func ProcessRIPEntry(announcedPrefix netip.Prefix, cost uint32, from netip.Addr)
 				ent.UpdatedAt = time.Now()
 				ent.HopCost = newCost
 				RoutingTable.Entries[announcedPrefix] = ent
-				updateChan <- ent
+				RoutingTable.RouteUpdateChan <- ent
 				return
 			}
 		} else {
@@ -335,13 +343,17 @@ func ProcessRIPEntry(announcedPrefix netip.Prefix, cost uint32, from netip.Addr)
 			ent.NextHopVIPAddr = from
 			ent.UpdatedAt = time.Now()
 			RoutingTable.Entries[announcedPrefix] = ent
-			updateChan <- ent
+			RoutingTable.RouteUpdateChan <- ent
 			return 
 		}
 	}
 }
 
-// RIP protocol (200)
+// RIP protocol 
+// - Unmarshal the rip message
+// - For each entry in the message
+//   - Check if the entry deserves to be added to our routing table
+//     - if yes -> let the ip stack know about the new route
 func HandleRIPProtocol(packet *packet.Packet) {
 	ripMessage := UnMarshalRIPBytes(packet.Payload)
 	for _, ent := range ripMessage.Entries {

@@ -2,9 +2,9 @@ package ipstack
 
 import (
 	"bufio"
+	"errors"
 	"net/netip"
 	"netstack/pkg/link"
-	"netstack/pkg/lnxconfig"
 	"netstack/pkg/packet"
 	"netstack/pkg/proto"
 	"netstack/pkg/util"
@@ -71,7 +71,13 @@ func CreateIPStack() *IpStack {
 }
 
 // Given "config", initialize the ip struct and link structs
-func (ip *IpStack) Initialize(config *lnxconfig.IPConfig) {
+// - init interfaces
+// - init arp tables (for now)
+// - init forwarding table with local & static routes
+// - init rip protocol (for routers)
+// - register ip protocol handlers
+// - start routines for processing packets and updating forwarding tables
+func (ip *IpStack) Initialize(config *util.IPConfig) {
 	// ============== Interface ==============
 	for _, i := range config.Interfaces {
 		ip.NameToPrefix[i.Name] = i.AssignedPrefix
@@ -129,7 +135,7 @@ func (ip *IpStack) Initialize(config *lnxconfig.IPConfig) {
 	}
 
 	// ================== RIP ==================
-	if config.RoutingMode == lnxconfig.RoutingTypeRIP {
+	if config.RoutingMode == util.RoutingTypeRIP {
 		ip.RipEnabled = true
 		proto.InitializeRoutingTable(ip.ForwardingTable, ip.RouteChan)
 	} else {
@@ -184,26 +190,12 @@ func (ip *IpStack) InitializeInterfaces() {
 	}
 }
 
+// Given an Echo Request ICMP packet, responsd to it by creating and sending ICMP Echo Reply
 func (ip *IpStack) SendEchoReply(pac *packet.Packet, icmpPacket *proto.ICMPPacket) {
+	// Construct Echo Reply Message
 	rep, err := proto.CreateEchoReplyMessageFrom(icmpPacket)
 	if err != nil {
 		ip.errorChan <- err.Error()
-		return
-	}
-	finalDst := pac.IPHeader.Src
-	// Get the next hop to src ip
-	nextHop, found := ip.GetNextHop(finalDst)
-	if !found {
-		ip.errorChan <- "no nexthop for icmp\n"
-		return
-	}
-	link, ok := ip.Subnets[ip.NameToPrefix[nextHop.InterfaceName]]
-	if !ok {
-		ip.errorChan <- "if not found\n"
-		return
-	}
-	if !link.IsUp {
-		ip.errorChan <- "icmp cannot be sent from downed link\n"
 		return
 	}
 	icmpBytes, err := rep.Marshal()
@@ -211,52 +203,87 @@ func (ip *IpStack) SendEchoReply(pac *packet.Packet, icmpPacket *proto.ICMPPacke
 		ip.errorChan <- err.Error()
 		return
 	}
-	// Create the packet
-	newPacket := packet.CreateNewPacket(icmpBytes, link.IPAddr, finalDst, util.ICMP_PROTO, util.DEFAULT_TTL)
-	if nextHop.EntryType == util.HOP_LOCAL {
-		// LOCAL delivery
-		err = link.SendLocal(newPacket, finalDst, false)
-	} else {
-		// FORWARD
-		err = link.SendLocal(newPacket, nextHop.NextHopVIPAddr, false)
-	}
+
+	finalDst := pac.IPHeader.Src
+	// Create the IP packet
+	newPacket := packet.CreateNewPacket(icmpBytes, pac.IPHeader.Dst, finalDst, util.ICMP_PROTO, util.DEFAULT_TTL)
+	// Send
+	err = ip.SendPacket(newPacket, false)
 	if err != nil {
 		ip.errorChan <- err.Error()
 		return
 	}
 }
 
+// Given an Echo Request ICMP packet, responsd to it by creating and sending ICMP Echo Reply
+func (ip *IpStack) SendEchoRequest(ttl int, to netip.Addr) (int, int) {
+	link, valid := ip.GetOutgoingLink(to)
+	if !valid {
+		return 0, 0
+	}
+	echoRequestMessage, err, id, seq := proto.CreateEchoRequestMessageFrom([]byte("aaaa"))
+	if err != nil {
+		ip.errorChan <- err.Error()
+		return 0, 0
+	}
+
+	icmpBytes, err := echoRequestMessage.Marshal()
+	if err != nil {
+		ip.errorChan <- err.Error()
+		return 0, 0
+	}
+	// Create the packet
+	newPacket := packet.CreateNewPacket(icmpBytes, link.IPAddr, to, util.ICMP_PROTO, ttl)
+	err = ip.SendPacket(newPacket, false)
+	if err != nil {
+		ip.errorChan <- err.Error()
+		return 0, 0
+	}
+	return id, seq
+}
+
+// Function that sends an ICMP Packet with type "t" and code "c" 
+// in response to invalid packet "packet"
 func (ip *IpStack) SendICMP(packet *packet.Packet, t uint8, c uint8) {
+	// Get outgoing link
 	finalDst := packet.IPHeader.Src
-	// Get the next hop to src ip
-	nextHop, found := ip.GetNextHop(finalDst)
-	if !found {
-		ip.errorChan <- "no nexthop for icmp\n"
+	link, valid := ip.GetOutgoingLink(finalDst)
+	if !valid {
 		return
 	}
-	link, ok := ip.Subnets[ip.NameToPrefix[nextHop.InterfaceName]]
-	if !ok {
-		ip.errorChan <- "if not found\n"
-		return
-	}
-	if !link.IsUp {
-		ip.errorChan <- "icmp cannot be sent from downed link\n"
-		return
-	}
+	// Create ICMP Packet
 	icmpPacket, err := link.CreateICMPPacketTo(t, c, packet)
 	if err != nil {
 		ip.errorChan <- err.Error()
 		return
 	}
-	if nextHop.EntryType == util.HOP_LOCAL {
-		// LOCAL delivery
-		err = link.SendLocal(icmpPacket, finalDst, false)
-	} else {
-		// FORWARD
-		err = link.SendLocal(icmpPacket, nextHop.NextHopVIPAddr, false)
-	}
+	// Send
+	err = ip.SendPacket(icmpPacket, false)
 	if err != nil {
 		ip.errorChan <- err.Error()
+	}
+}
+
+// Send a single packet "packet".
+// If "f" is set, meaning we are forwarding the packet, decrement the TTL
+// - Get the NextHop by consulting the routing table
+// - Get the outgoing interface
+// - Send the packet out from that interface
+func (ip *IpStack) SendPacket(packet *packet.Packet, f bool) error {
+	// Get the next hop
+	nextHop, found := ip.GetNextHop(packet.IPHeader.Dst)
+	if !found {
+		return errors.New("next hop not found")
+	}
+	// Get the link to send out from
+	link := ip.Subnets[ip.NameToPrefix[nextHop.InterfaceName]]
+
+	if nextHop.EntryType == util.HOP_LOCAL {
+		// LOCAL delivery
+		return link.SendLocal(packet, packet.IPHeader.Dst, f)
+	} else {
+		// FORWARD
+		return link.SendLocal(packet, nextHop.NextHopVIPAddr, f)
 	}
 }
 
@@ -277,12 +304,13 @@ func (ip *IpStack) ProcessPackets() {
 					if packet.IPHeader.Protocol == util.ICMP_PROTO {
 						// Separately process ICMP
 						icmpPacket := proto.UnMarshalICMPPacket(packet.Payload)
-						// Needs to respond to echo request
 						if icmpPacket.ICMPHeader.Type == proto.ECHO_REQUEST {
+							// Needs to respond to echo request
 							ip.SendEchoReply(packet, icmpPacket)
-						} else {
-							ip.ICMPChan <- packet
+							continue
 						}
+						// Else just send to the channel
+						ip.ICMPChan <- packet
 					}
 				}
 				continue
@@ -292,30 +320,10 @@ func (ip *IpStack) ProcessPackets() {
 				ip.SendICMP(packet, proto.TIME_EXCEEDED, proto.TIME_EXCEEDED_TTL)
 				continue
 			}
-			// Get the next hop
-			nextHop, found := ip.GetNextHop(packet.IPHeader.Dst)
-			if !found {
-				ip.SendICMP(packet, proto.DST_UNREACHABLE, proto.DST_UNREACHABLE_NETWORK)
-				continue
-			}
-			// Get the link to send out from
-			link := ip.Subnets[ip.NameToPrefix[nextHop.InterfaceName]]
-			if !link.IsUp {
-				ip.SendICMP(packet, proto.DST_UNREACHABLE, proto.DST_UNREACHABLE_NETWORK)
-				continue
-			}
-			var err error
-			if nextHop.EntryType == util.HOP_LOCAL {
-				// LOCAL delivery
-				err = link.SendLocal(packet, packet.IPHeader.Dst, true)
-			} else {
-				// FORWARD
-				err = link.SendLocal(packet, nextHop.NextHopVIPAddr, true)
-			}
+			// Send Packet to next hop
+			err := ip.SendPacket(packet, true)
 			if err != nil {
-				if err.Error() == "ARP" {
-					ip.SendICMP(packet, proto.DST_UNREACHABLE, proto.DST_UNREACHABLE_NETWORK)
-				}
+				ip.SendICMP(packet, proto.DST_UNREACHABLE_NETWORK, proto.DST_UNREACHABLE_NETWORK)
 			}
 		case errString := <-ip.errorChan:
 			ip.Writer.WriteString("\nError: " + errString + "\n> ")
@@ -327,35 +335,115 @@ func (ip *IpStack) ProcessPackets() {
 	}
 }
 
+// Keep listening for better routes discovered via RIP
 // A new/better route is sent to the "RouteChan" so keep monitoring
+// Two possibilities
+// - if sent route "r" is expired
+//   - this signifies unreachability of the existing route in the forwarding table
+//   - promptly remove
+//
+// - else
+//   - it is strictly better route so update the forwardiing table
+//
+// Once we have dealt with the route, trigger our neighbors about the change
+// by sending to all the "triChan"s
 func (ip *IpStack) CheckForRouteUpdates() {
 	for r := range ip.RouteChan {
 		ip.ftMtx.Lock()
 		if r.Expired {
-			// This route update is for delete (expired)
+			// Expired == Unreachable
 			_, ok := ip.ForwardingTable[r.Prefix]
 			if !ok {
 				panic("trying to delete non-existent entry")
 			}
 			delete(ip.ForwardingTable, r.Prefix)
-			r.HopCost = proto.INF // unreachability
+			r.HopCost = proto.INF
 		} else {
-			// This route update is for upgrade
-			// Add the new route
+			// Strictly better route
 			nh, _ := ip.GetNextHop(r.NextHopVIPAddr)
 			r.InterfaceName = nh.InterfaceName
 			ip.ForwardingTable[r.Prefix] = r
 		}
 		ip.ftMtx.Unlock()
 
-		// Trigger update to neighbors
+		// Trigger update to all neighbors
 		for _, triChan := range ip.TriggerChans {
 			triChan <- r
 		}
 	}
 }
 
-// Helper to check if this packet is destined to one of my interfaces
+// TraceRoute to IP Address given by "to"
+// - send ICMP Echo Request to "to" with "ttl"
+// - wait until we receive ICMP TIME_EXCEEDED or ICMP ECHO_REPLY
+//   - TIME_EXCEEDED -> mid way
+//   - ECHO_REPLY -> successfully reach the destination
+func (ip *IpStack) TraceRoute(ttl int, to netip.Addr, res chan netip.Addr) {
+	// Send Echo Request
+	id, seq := ip.SendEchoRequest(ttl, to)
+	// Wait for ICMP or timeout
+	timer := time.NewTimer(1 * time.Second)
+	for {
+		select {
+		case pac := <-ip.ICMPChan:
+			{
+				icmpPacket := proto.UnMarshalICMPPacket(pac.Payload)
+				// Not Echo Reply or TTL Exceeded
+				if (icmpPacket.ICMPHeader.Type != proto.ECHO_REPLY) &&
+					(icmpPacket.ICMPHeader.Type != proto.TIME_EXCEEDED) {
+					continue
+				}
+				// Check ID and SEQ
+				var payload []byte
+				if icmpPacket.ICMPHeader.Type == proto.TIME_EXCEEDED {
+					// TIME_EXCEEDED
+					payload = icmpPacket.Payload[util.HeaderLen+4 : util.HeaderLen+8]
+				} else {
+					// ECHO REPLY
+					payload = icmpPacket.ICMPHeader.Data[:]
+				}
+				matchID, matchSEQ := util.ExtractIdSeq(payload)
+				if matchID != uint16(id) || matchSEQ != uint16(seq) {
+					// No match
+					continue
+				}
+				// Valid
+				res <- pac.IPHeader.Src
+				return
+			}
+		case <-timer.C:
+			{
+				// Time is up
+				res <- netip.Addr{}
+				return
+			}
+		}
+	}
+}
+
+// ================ Helper ===================
+
+// Given destination IP address "dst", see to which interface
+// our next hop is connected to. Return that interface
+func (ip *IpStack) GetOutgoingLink(dst netip.Addr) (*link.Link, bool) {
+	nextHop, found := ip.GetNextHop(dst)
+	if !found {
+		ip.errorChan <- "no nexthop for icmp\n"
+		return &link.Link{}, false
+	}
+	li, ok := ip.Subnets[ip.NameToPrefix[nextHop.InterfaceName]]
+	if !ok {
+		ip.errorChan <- "if not found\n"
+		return &link.Link{}, false
+	}
+	if !li.IsUp {
+		ip.errorChan <- "icmp cannot be sent from downed link\n"
+		return &link.Link{}, false
+	}
+	return li, true
+}
+
+// Checks if this packet is destined to one of my interfaces
 // if so, dst should match to one of our links' assigned IPAddr
 func (ip *IpStack) IsThisMyPacket(dst netip.Addr) bool {
 	for _, i := range ip.Subnets {
@@ -388,90 +476,4 @@ func (ip *IpStack) GetNextHop(dst netip.Addr) (proto.NextHop, bool) {
 	}
 
 	return niHop, true
-}
-
-// TraceRoute to IP Address given by "to"
-func (ip *IpStack) TraceRoute(ttl int, to netip.Addr, res chan netip.Addr) {
-	// Get the next hop
-	nextHop, found := ip.GetNextHop(to)
-	if !found {
-		ip.errorChan <- "no nexthop for icmp\n"
-		return
-	}
-	// Get the link to send out from
-	link, ok := ip.Subnets[ip.NameToPrefix[nextHop.InterfaceName]]
-	if !ok {
-		ip.errorChan <- "if not found\n"
-		return
-	}
-	// Check link status
-	if !link.IsUp {
-		ip.errorChan <- "icmp cannot be sent from downed link\n"
-		return
-	}
-	echoRequestMessage, err, id, seq := proto.CreateEchoRequestMessageFrom([]byte("aaaa"))
-	if err != nil {
-		ip.errorChan <- err.Error()
-		return
-	}
-
-	icmpBytes, err := echoRequestMessage.Marshal()
-	if err != nil {
-		ip.errorChan <- err.Error()
-		return
-	}
-	// Create the packet
-	newPacket := packet.CreateNewPacket(icmpBytes, link.IPAddr, to, util.ICMP_PROTO, ttl)
-	if nextHop.EntryType == util.HOP_LOCAL {
-		// LOCAL delivery
-		err = link.SendLocal(newPacket, to, false)
-	} else {
-		// FORWARD
-		err = link.SendLocal(newPacket, nextHop.NextHopVIPAddr, false)
-	}
-	if err != nil {
-		ip.errorChan <- err.Error()
-		return
-	}
-	// Wait
-	// - Successfully Reach the target == ECHO REPLY
-	// - TTL MAX Reached == ICMP TTL EXCEEDED
-	timer := time.NewTimer(5 * time.Second)
-	for {
-		select {
-		case pac := <-ip.ICMPChan:
-			{
-				icmpPacket := proto.UnMarshalICMPPacket(pac.Payload)
-				// Not Echo Reply
-				if (icmpPacket.ICMPHeader.Type != proto.ECHO_REPLY) &&
-					(icmpPacket.ICMPHeader.Type != proto.TIME_EXCEEDED) {
-					continue
-				}
-				// If Time Exceeded
-				if icmpPacket.ICMPHeader.Type == proto.TIME_EXCEEDED {
-					// Check the payload
-					matchID, matchSEQ := proto.ExtractIdSeq(icmpPacket.Payload[util.HeaderLen+4:util.HeaderLen+8])
-					// Check if it is in response to our trace route packet
-					if matchID != uint16(id) || matchSEQ != uint16(seq) {
-						continue
-					}
-					res <- pac.IPHeader.Src
-					return
-				}
-				// Match ID and SEQ
-				matchID, matchSEQ := proto.ExtractIdSeq(icmpPacket.ICMPHeader.Data[:])
-				if matchID != uint16(id) || matchSEQ != uint16(seq) {
-					continue
-				}
-				// Valid Echo Reply
-				res <- pac.IPHeader.Src
-			}
-		case <-timer.C:
-			{
-				// Time is up
-				res <- netip.Addr{}
-				return
-			}
-		}
-	}
 }

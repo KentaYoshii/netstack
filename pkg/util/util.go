@@ -5,7 +5,7 @@ import (
 	"net"
 	"net/netip"
 	"strings"
-
+	"encoding/binary"
 	"github.com/google/netstack/tcpip/header"
 	"github.com/praserx/ipconv"
 )
@@ -22,6 +22,7 @@ const (
 type HopType int
 
 const (
+	// NextHop Type
 	HOP_RIP HopType = iota
 	HOP_LOCAL
 	HOP_STATIC
@@ -70,15 +71,24 @@ func GetNumSharedPrefix(a1 netip.Addr, a2 netip.Addr) int {
 	return cnt
 }
 
+// Validate checksum for given bytes "b" and given checusum "fromHeader"
 func ValidateChecksum(b []byte, fromHeader uint16) uint16 {
 	checksum := header.Checksum(b, fromHeader)
 
 	return checksum
 }
 
+// Compute checksum for the given bytes b
 func ComputeChecksum(b []byte) uint16 {
 	checksum := header.Checksum(b, 0)
 	checksumInv := checksum ^ 0xffff
 
 	return checksumInv
+}
+
+// For ECHO_REQUEST and ECHO_REPLY
+func ExtractIdSeq(from []byte) (uint16, uint16) {
+	id := binary.BigEndian.Uint16(from[0:2])
+	seq := binary.BigEndian.Uint16(from[2:4])
+	return id, seq
 }

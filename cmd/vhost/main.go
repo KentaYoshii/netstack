@@ -3,9 +3,9 @@ package main
 import (
 	"log"
 	"os"
-	"netstack/pkg/lnxconfig"
 	"netstack/pkg/ipstack"
 	"netstack/pkg/repl"
+	"netstack/pkg/util"
 )
 
 func main() {
@@ -13,7 +13,7 @@ func main() {
 		log.Fatalf("Usage:  %s --config <linksfile>\n", os.Args[0])
 	}
 	// Parse the file
-	lnxConfig, err := lnxconfig.ParseConfig(os.Args[2])
+	lnxConfig, err := util.ParseConfig(os.Args[2])
 	if err != nil {
 		log.Fatalln(err)
 	}

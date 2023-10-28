@@ -1,4 +1,4 @@
-package lnxconfig
+package util
 
 import (
 	"bufio"

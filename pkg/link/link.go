@@ -60,6 +60,9 @@ func (li *Link) arpLookup(dst netip.Addr) (netip.AddrPort, bool) {
 // Given payload, destination IP address and IP Header, send the packet to the
 // MAC Address corresponding to the passed in IP Address
 func (li *Link) SendLocal(packet *packet.Packet, dst netip.Addr, f bool) error {
+	if !li.IsUp {
+		return errors.New("link is down")
+	}
 	// ARP look up
 	dstMACAddr, found := li.arpLookup(dst)
 	if !found {

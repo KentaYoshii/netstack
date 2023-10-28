@@ -147,10 +147,8 @@ func (r *Repl) handleListRoutes(args []string) string {
 	b.WriteString(fmt.Sprintf("%-6s %-15s %-10s %s\n", "-", "------", "--------", "----"))
 	b.WriteString(fmt.Sprintf("%-6s %-15s %-10s %s\n", "T", "Prefix", "Next hop", "COST"))
 	b.WriteString(fmt.Sprintf("%-6s %-15s %-10s %s\n", "-", "------", "--------", "----"))
-	// Loop our routing table next
-	proto.RtMtx.Lock()
-	defer proto.RtMtx.Unlock()
-	for prefix, ent := range proto.RoutingTable.Entries {
+	// Loop our forwarding table
+	for prefix, ent := range r.HostInfo.ForwardingTable {
 		var cost, t, name string
 		if ent.EntryType == util.HOP_STATIC {
 			name = ent.NextHopVIPAddr.String()
@@ -193,6 +191,7 @@ func (r *Repl) handleHelp(args []string) string {
 	b.WriteString(fmt.Sprintf("%-6s %-15s\n", "up", "Enable an interface"))
 	b.WriteString(fmt.Sprintf("%-6s %-15s\n", "down", "Disable an interface"))
 	b.WriteString(fmt.Sprintf("%-6s %-15s\n", "send", "Send test packet"))
+	b.WriteString(fmt.Sprintf("%-6s %-15s\n", "tracert", "Traceroute to given ip"))
 	return b.String()
 }
 
@@ -216,22 +215,12 @@ func (r *Repl) handleSend(args []string) string {
 		return b.String()
 	}
 
-	nextHop, found := r.HostInfo.GetNextHop(destAddr)
-	if !found {
-		b.WriteString("Next Hop not found!\n")
+	link, valid := r.HostInfo.GetOutgoingLink(destAddr)
+	if !valid {
 		return b.String()
 	}
-	// Get the link to send out from
-	link := r.HostInfo.Subnets[r.HostInfo.NameToPrefix[nextHop.InterfaceName]]
 	newPacket := packet.CreateNewPacket([]byte(payloadString), link.IPAddr, destAddr, util.TEST_PROTO, util.DEFAULT_TTL)
-
-	if nextHop.EntryType == util.HOP_LOCAL {
-		// LOCAL delivery
-		err = link.SendLocal(newPacket, destAddr, false)
-	} else {
-		// FORWARD
-		err = link.SendLocal(newPacket, nextHop.NextHopVIPAddr, false)
-	}
+	err = r.HostInfo.SendPacket(newPacket, false)
 	if err != nil {
 		b.WriteString(err.Error())
 		return b.String()
@@ -266,9 +255,9 @@ func (r *Repl) handleUp(args []string) string {
 				InterfaceName:  li.InterfaceName,
 			}
 
-			proto.RtMtx.Lock()
+			proto.RoutingTable.RtMtx.Lock()
 			proto.RoutingTable.Entries[prefix] = newHop
-			proto.RtMtx.Unlock()
+			proto.RoutingTable.RtMtx.Unlock()
 
 			for _, triChan := range r.HostInfo.TriggerChans {
 				triChan <- newHop
@@ -298,9 +287,9 @@ func (r *Repl) handleDown(args []string) string {
 			li.IsUp = false
 
 			// Remove from the routing table
-			proto.RtMtx.Lock()
+			proto.RoutingTable.RtMtx.Lock()
 			delete(proto.RoutingTable.Entries, prefix)
-			proto.RtMtx.Unlock()
+			proto.RoutingTable.RtMtx.Unlock()
 
 			// Trigger Updates about the down status
 			newHop := proto.NextHop{
