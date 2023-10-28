@@ -3,6 +3,7 @@ package repl
 import (
 	"bufio"
 	"fmt"
+	"log/slog"
 	"net/netip"
 	"netstack/pkg/ipstack"
 	"netstack/pkg/packet"
@@ -68,6 +69,7 @@ func (r *Repl) StartREPL() {
 	r.RegisterCommandHandler("down", r.handleDown)
 	r.RegisterCommandHandler("tracert", r.handleTraceRt)
 	r.RegisterCommandHandler("ping", r.handlePing)
+	r.RegisterCommandHandler("setlog", r.handleSetLog)
 
 	for r.Scanner.Scan() {
 		// Split
@@ -380,4 +382,57 @@ func (r *Repl) handlePing(args []string) string {
 	b.WriteString(fmt.Sprintf("round-trip min/avg/max = %d/%f/%d ms\n",
 		rttMin, float32(rttAvg)/float32(okCnt), rttMax))
 	return b.String()
+}
+
+// Set Log Level
+func (r *Repl) handleSetLog(args []string) string {
+	var b strings.Builder
+	if len(args) != 2 {
+		b.WriteString("Usage: setlog <debug|info|warn|error>\n")
+		return b.String()
+	}
+	switch args[1] {
+	case "debug":
+		{
+			r.HostInfo.Logger = slog.New(util.NewPrettyHandler(os.Stdout, util.PrettyHandlerOptions{
+				SlogOpts: slog.HandlerOptions{
+					Level: slog.LevelDebug,
+				},
+			}))
+			break
+		}
+	case "info":
+		{
+			r.HostInfo.Logger = slog.New(util.NewPrettyHandler(os.Stdout, util.PrettyHandlerOptions{
+				SlogOpts: slog.HandlerOptions{
+					Level: slog.LevelInfo,
+				},
+			}))
+			break
+		}
+	case "warn":
+		{
+			r.HostInfo.Logger = slog.New(util.NewPrettyHandler(os.Stdout, util.PrettyHandlerOptions{
+				SlogOpts: slog.HandlerOptions{
+					Level: slog.LevelWarn,
+				},
+			}))
+			break
+		}
+	case "error":
+		{
+			r.HostInfo.Logger = slog.New(util.NewPrettyHandler(os.Stdout, util.PrettyHandlerOptions{
+				SlogOpts: slog.HandlerOptions{
+					Level: slog.LevelError,
+				},
+			}))
+			break
+		}
+	default:
+		{
+			b.WriteString("Usage: setlog <debug|info|warn|error>\n")
+			return b.String()
+		}
+	}
+	return ""
 }

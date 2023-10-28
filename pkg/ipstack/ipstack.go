@@ -58,7 +58,7 @@ func CreateIPStack() *IpStack {
 	return &IpStack{
 		Logger: slog.New(util.NewPrettyHandler(os.Stdout, util.PrettyHandlerOptions{
 			SlogOpts: slog.HandlerOptions{
-				Level: slog.LevelDebug,
+				Level: slog.LevelInfo,
 			},
 		})),
 		RipEnabled:         false,
