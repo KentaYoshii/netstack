@@ -217,7 +217,7 @@ func (li *Link) SendLocal(packet *packet.Packet, dst netip.Addr, f bool) error {
 // simply drop the packet
 func (li *Link) ListenAtInterface(packetChan chan *packet.Packet, errorChan chan string) {
 	for {
-		buf := make([]byte, util.MAX_PACKET_SIZE)
+		buf := make([]byte, util.MTU)
 		_, _, err := li.ListenConn.ReadFromUDP(buf)
 		if err != nil {
 			errorChan <- err.Error()

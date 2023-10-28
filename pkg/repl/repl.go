@@ -8,6 +8,7 @@ import (
 	"netstack/pkg/ipstack"
 	"netstack/pkg/packet"
 	"netstack/pkg/proto"
+	"netstack/pkg/socket"
 	"netstack/pkg/util"
 	"os"
 	"strconv"
@@ -58,6 +59,8 @@ func (r *Repl) WriteOutput(output string, prompt bool) {
 // Handle Command
 func (r *Repl) StartREPL() {
 	// Register Commands
+
+	// IP
 	r.RegisterCommandHandler("li", r.handleListInterface)
 	r.RegisterCommandHandler("ln", r.handleListNeighbors)
 	r.RegisterCommandHandler("lr", r.handleListRoutes)
@@ -70,6 +73,18 @@ func (r *Repl) StartREPL() {
 	r.RegisterCommandHandler("tracert", r.handleTraceRt)
 	r.RegisterCommandHandler("ping", r.handlePing)
 	r.RegisterCommandHandler("setlog", r.handleSetLog)
+
+	// TCP (only hosts can do these)
+	if !r.HostInfo.RipEnabled {
+		r.RegisterCommandHandler("a", r.handleSocketListenAndAccept)
+		r.RegisterCommandHandler("c", r.handleSocketConnect)
+		r.RegisterCommandHandler("s", r.handleSocketSend)
+		r.RegisterCommandHandler("r", r.handleSocketReceive)
+		r.RegisterCommandHandler("cl", r.handleSocketClose)
+		r.RegisterCommandHandler("ls", r.handleSocketList)
+		r.RegisterCommandHandler("sf", r.handleSocketSendFile)
+		r.RegisterCommandHandler("rf", r.handleSocketReceiveFile)
+	}
 
 	for r.Scanner.Scan() {
 		// Split
@@ -96,7 +111,123 @@ func (r *Repl) StartREPL() {
 	}
 }
 
-// ---------- Handler Functions ----------
+// ============= Handler Functions (TCP) ============
+
+// Handle "a" command (a <port>)
+// - Start listening and accepting on a port
+func (r *Repl) handleSocketListenAndAccept(args []string) string {
+	var b strings.Builder
+
+	if len(args) != 2 {
+		b.WriteString("Usage: a <port>")
+		return b.String()
+	}
+
+	return ""
+}
+
+// Handle "c" command (c <ip> <port>)
+// - Connect to a socket
+func (r *Repl) handleSocketConnect(args []string) string {
+	var b strings.Builder
+
+	if len(args) != 3 {
+		b.WriteString("Usage: c <ip> <port>")
+		return b.String()
+	}
+
+	return ""
+}
+
+// Handle "s" command (s <sid> <payload>)
+// - Send data using a socket
+func (r *Repl) handleSocketSend(args []string) string {
+	var b strings.Builder
+
+	if len(args) != 3 {
+		b.WriteString("Usage: s <sid> <payload>")
+		return b.String()
+	}
+
+	return ""
+}
+
+// Handle "r" command (r <sid> <numbytes>)
+// - Recieve data using a socket
+func (r *Repl) handleSocketReceive(args []string) string {
+	var b strings.Builder
+
+	if len(args) != 3 {
+		b.WriteString("Usage: r <sid> <numbytes>")
+		return b.String()
+	}
+
+	return ""
+}
+
+// Handle "cl" command (cl <sid>)
+// - Close a socket
+func (r *Repl) handleSocketClose(args []string) string {
+	var b strings.Builder
+
+	if len(args) != 2 {
+		b.WriteString("Usage: cl <sid>")
+		return b.String()
+	}
+
+	return ""
+}
+
+// Handle "ls" command (ls)
+// - List all sockets in the socket table
+func (r *Repl) handleSocketList(args []string) string {
+	var b strings.Builder
+
+	if len(args) != 1 {
+		b.WriteString("Usage: ls")
+		return b.String()
+	}
+
+	proto.SocketTable.StMtx.Lock()
+	defer proto.SocketTable.StMtx.Unlock()
+
+	b.WriteString(fmt.Sprintf("%-4s%-15s%-7s%-15s%-7s%-10s\n", "---", "-----", "-----", "-----", "-----", "------"))
+	b.WriteString(fmt.Sprintf("%-4s%-15s%-7s%-15s%-7s%-10s\n", "SID", "LAddr", "LPort", "RAddr", "RPort", "Status"))
+	b.WriteString(fmt.Sprintf("%-4s%-15s%-7s%-15s%-7s%-10s\n", "---", "-----", "-----", "-----", "-----", "------"))
+
+	for _, tcb := range proto.SocketTable.Table {
+		b.WriteString(fmt.Sprintf("%-4d%-15s%-7d%-15s%-7d%-10s\n",
+			tcb.SID, tcb.Laddr.String(), tcb.Lport, tcb.Raddr.String(), tcb.Rport, socket.ToSocketStateStr(tcb.State)))
+	}
+
+	return b.String()
+}
+
+// Handle "sf" command (sf <file path> <ip addr> <port>)
+// - Send a file using a socket
+func (r *Repl) handleSocketSendFile(args []string) string {
+	var b strings.Builder
+
+	if len(args) != 4 {
+		b.WriteString("Usage: sf <file path> <ip addr> <port>")
+		return b.String()
+	}
+	return ""
+}
+
+// Handle "rf" command (rf <dest file path> <port>)
+// - Receive a file using a socket
+func (r *Repl) handleSocketReceiveFile(args []string) string {
+	var b strings.Builder
+
+	if len(args) != 3 {
+		b.WriteString("Usage: rf <dest file path> <port>")
+		return b.String()
+	}
+	return ""
+}
+
+// ============= Handler Functions (IP) ============
 
 // Handle "info" command
 func (r *Repl) handleInfo(args []string) string {
@@ -182,6 +313,7 @@ func (r *Repl) handleEcho(args []string) string {
 // Handle "help" command
 func (r *Repl) handleHelp(args []string) string {
 	var b strings.Builder
+	// IP
 	b.WriteString(fmt.Sprintf("%-6s %-15s\n", "-------", "-----------"))
 	b.WriteString(fmt.Sprintf("%-6s %-15s\n", "Command", "Description"))
 	b.WriteString(fmt.Sprintf("%-6s %-15s\n", "-------", "-----------"))
@@ -197,6 +329,17 @@ func (r *Repl) handleHelp(args []string) string {
 	b.WriteString(fmt.Sprintf("%-6s %-15s\n", "tracert", "Traceroute to given ip"))
 	b.WriteString(fmt.Sprintf("%-6s %-15s\n", "ping", "Ping the given ip"))
 
+	// TCP
+	if !r.HostInfo.RipEnabled {
+		b.WriteString(fmt.Sprintf("%-6s %-15s\n", "a", "Start listening and accepting on a port"))
+		b.WriteString(fmt.Sprintf("%-6s %-15s\n", "c", "Connect to a listening socket at addr port"))
+		b.WriteString(fmt.Sprintf("%-6s %-15s\n", "s", "Send to the socket"))
+		b.WriteString(fmt.Sprintf("%-6s %-15s\n", "r", "Read from the socket"))
+		b.WriteString(fmt.Sprintf("%-6s %-15s\n", "cl", "Close the socket"))
+		b.WriteString(fmt.Sprintf("%-6s %-15s\n", "ls", "List socket table"))
+		b.WriteString(fmt.Sprintf("%-6s %-15s\n", "sf", "Send a file to the socket"))
+		b.WriteString(fmt.Sprintf("%-6s %-15s\n", "rf", "Read a file from the socket"))
+	}
 	return b.String()
 }
 
@@ -345,7 +488,11 @@ func (r *Repl) handlePing(args []string) string {
 		b.WriteString("Usage: ping <count> <ip address>\n")
 		return b.String()
 	}
-	cnt, _ := strconv.Atoi(args[1])
+	cnt, err := strconv.Atoi(args[1])
+	if err != nil {
+		b.WriteString(err.Error())
+		return b.String()
+	}
 	destAddr, err := netip.ParseAddr(args[2])
 	if err != nil {
 		b.WriteString(err.Error())

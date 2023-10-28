@@ -13,12 +13,18 @@ import (
 )
 
 const (
+	// Initial Node setup timeout
 	INITIAL_SETUP_TO = 500
-	MAX_PACKET_SIZE  = 1400
-	TEST_PROTO       = 0
-	ICMP_PROTO       = 1
-	RIP_PROTO        = 200
-	TRACERT_UDP      = 34534
+	// Max Packet Size
+	MTU = 1400
+
+	TEST_PROTO = 0
+	ICMP_PROTO = 1
+	TCP_PROTO  = 6
+	RIP_PROTO  = 200
+
+	// Retransmission
+	MAX_RETRANS = 3
 )
 
 type HopType int
@@ -30,14 +36,18 @@ const (
 	HOP_STATIC
 )
 
+// Given "nn" representing IP Address in uint32, return
+// corresponding IP Address
 func Int2ip(nn uint32) net.IP {
 	return ipconv.IntToIPv4(nn)
 }
 
+// Given "ip" in net.IP, convert it to uint32 and return that
 func Ip2int(ip net.IP) (uint32, error) {
 	return ipconv.IPv4ToInt(ip)
 }
 
+// Given a port in uint16, convert it to 2-byte array
 func PortAs2(port uint16) [2]byte {
 	buf := new(bytes.Buffer)
 	binary.Write(buf, binary.BigEndian, port)

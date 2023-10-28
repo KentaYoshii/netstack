@@ -42,7 +42,7 @@ type IpStack struct {
 	ICMPChan chan *packet.Packet
 	// Channel through which new route entries are sent
 	RouteChan chan proto.NextHop
-	// Channels through which triggered updates are communicated
+	// Channels through which triggered updates are communicated to link layer
 	TriggerChans []chan proto.NextHop
 	// Channel for getting non-serious error messages
 	errorChan chan string
@@ -142,13 +142,17 @@ func (ip *IpStack) Initialize(config *util.IPConfig) {
 		}
 	}
 
-	// ================== RIP ==================
 	if config.RoutingMode == util.RoutingTypeRIP {
+		// if router, initialize routing table
 		ip.RipEnabled = true
 		proto.InitializeRoutingTable(ip.ForwardingTable, ip.RouteChan)
 	} else {
+		// if host, initialize socket table
 		ip.RipEnabled = false
+		proto.InitializeSocketTable()
 	}
+
+	// ================== RIP ==================
 	if ip.RipEnabled {
 		for _, neighbor := range config.RipNeighbors {
 			for prefix, li := range ip.Subnets {
