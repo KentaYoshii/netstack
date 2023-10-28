@@ -1,11 +1,13 @@
 package util
 
 import (
+	"bytes"
+	"encoding/binary"
 	"fmt"
 	"net"
 	"net/netip"
 	"strings"
-	"encoding/binary"
+
 	"github.com/google/netstack/tcpip/header"
 	"github.com/praserx/ipconv"
 )
@@ -30,6 +32,16 @@ const (
 
 func Int2ip(nn uint32) net.IP {
 	return ipconv.IntToIPv4(nn)
+}
+
+func Ip2int(ip net.IP) (uint32, error) {
+	return ipconv.IPv4ToInt(ip)
+}
+
+func PortAs2(port uint16) [2]byte {
+	buf := new(bytes.Buffer)
+	binary.Write(buf, binary.BigEndian, port)
+	return [2]byte(buf.Bytes())
 }
 
 // Given an int, convert to a binary string

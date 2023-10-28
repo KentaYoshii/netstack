@@ -1,6 +1,7 @@
 package link
 
 import (
+	"encoding/binary"
 	"errors"
 	"net"
 	"net/netip"
@@ -28,6 +29,12 @@ type Link struct {
 
 	// Chan
 	ErrorChan chan string
+	InfoChan  chan string
+	ARPChan   chan ARPEntry
+
+	// For ARP
+	// - to simulate, we kinda need these
+	BroadCastAddrs []netip.AddrPort
 }
 
 // Function that initializes the Link by start listening at the assigned UDP address
@@ -45,17 +52,132 @@ func (li *Link) InitializeLink() error {
 	return nil
 }
 
-// Given IP address and corresponding MAC address,
-// add the pair to the ARP table
-func (li *Link) AddNeighbor(nIP netip.Addr, nMAC netip.AddrPort) {
-	li.ARPTable[nIP] = nMAC
+// Add the neighbor to our broadcast list to be used in arp
+func (li *Link) AddNeighbor(nMAC netip.AddrPort) {
+	li.BroadCastAddrs = append(li.BroadCastAddrs, nMAC)
 }
 
 // Given one of the LOCAL destinatio IP address, use the ARP table to
 // look up the corresponding MAC Address
+// If no such entry is found for "dst", broadcast an ARP request
 func (li *Link) arpLookup(dst netip.Addr) (netip.AddrPort, bool) {
 	res, ok := li.ARPTable[dst]
+	if !ok {
+		// Broadcast
+		err := li.broadcast(dst)
+		if err != nil {
+			// ARP failed
+			li.ErrorChan <- err.Error()
+			return res, ok
+		}
+		// Success
+		return li.ARPTable[dst], true
+	}
 	return res, ok
+}
+
+// If ARP miss, broadcast to LAN
+// Create an ARP Request frame, and for each known hosts in the LAN, send
+// Timeout or return nil if valid ARP Reply is received
+func (li *Link) broadcast(dst netip.Addr) error {
+	// We wish to find the MAC Addr for "dst"
+	// First set stuff up
+	spa := li.IPAddr.As4()
+	tpa := dst.As4()
+	sha_addr_as_4 := li.ListenAddr.Addr().As4()
+	sha_port_as_2 := util.PortAs2(li.ListenAddr.Port())
+	sha := [6]byte{
+		sha_addr_as_4[0],
+		sha_addr_as_4[1],
+		sha_addr_as_4[2],
+		sha_addr_as_4[3],
+		sha_port_as_2[0],
+		sha_port_as_2[1],
+	}
+	// tha is ignored in arp request
+	arpBytes, err := CreateARPFrame(sha, spa, [6]byte{0}, tpa, ARP_REQUEST)
+	if err != nil {
+		return err
+	}
+	// broadcast
+	for _, host := range li.BroadCastAddrs {
+		// Resolve Address and Send
+		resolvedUDPAddr, _ := net.ResolveUDPAddr("udp4", host.String())
+		li.ListenConn.WriteToUDP(arpBytes, resolvedUDPAddr)
+	}
+	// wait or timeout
+	timer := time.NewTimer(ARP_TO * time.Second)
+	for {
+		select {
+		case <-timer.C:
+			{
+				return errors.New("ARP broadcast timeout")
+			}
+		case ent := <-li.ARPChan:
+			{
+				// Add to Cache
+				li.InfoChan <- "Adding (" + ent.IPAddress.String() + ", " + ent.MACAddress.String() + ") to ARP Cache"
+				li.ARPTable[ent.IPAddress] = ent.MACAddress
+				// Check if this is the desired one
+				if ent.IPAddress == dst {
+					return nil
+				}
+			}
+		}
+	}
+}
+
+// Given ARP Message bytes check if we need to do anything with it
+func (li *Link) HandleARPMessage(b []byte) {
+	ARPMessage := UnMarshalARPFrame(b)
+	// Check if I am the target IP or not
+	if netip.AddrFrom4(ARPMessage.TPA) != li.IPAddr {
+		return
+	}
+	// IF ARP Request
+	if ARPMessage.Operation == ARP_REQUEST {
+		// First set stuff up
+		spa := li.IPAddr.As4()
+		tpa := ARPMessage.SPA
+		sha_addr_as_4 := li.ListenAddr.Addr().As4()
+		sha_port_as_2 := util.PortAs2(li.ListenAddr.Port())
+		sha := [6]byte{
+			sha_addr_as_4[0],
+			sha_addr_as_4[1],
+			sha_addr_as_4[2],
+			sha_addr_as_4[3],
+			sha_port_as_2[0],
+			sha_port_as_2[1],
+		}
+		tha := ARPMessage.SHA
+		arpBytes, err := CreateARPFrame(sha, spa, tha, tpa, ARP_REPLY)
+		if err != nil {
+			return
+		}
+		// Resolve Address
+		targetAddr := netip.AddrFrom4([4]byte{tha[0], tha[1], tha[2], tha[3]})
+		targetPort := binary.BigEndian.Uint16([]byte{tha[4], tha[5]})
+		targetMACAddr := netip.AddrPortFrom(targetAddr, targetPort)
+		resolvedUDPAddr, _ := net.ResolveUDPAddr("udp4", targetMACAddr.String())
+		li.ListenConn.WriteToUDP(arpBytes, resolvedUDPAddr)
+		// Add to our cache
+		li.ARPTable[netip.AddrFrom4(tpa)] = targetMACAddr
+	} else if ARPMessage.Operation == ARP_REPLY {
+		// If ARP Reply, send to the channel
+		targetIPAddr := netip.AddrFrom4(ARPMessage.SPA)
+		// Resolve Address
+		targetAddr := netip.AddrFrom4([4]byte{
+			ARPMessage.SHA[0],
+			ARPMessage.SHA[1],
+			ARPMessage.SHA[2],
+			ARPMessage.SHA[3]})
+		targetPort := binary.BigEndian.Uint16([]byte{ARPMessage.SHA[4], ARPMessage.SHA[5]})
+		targetMACAddr := netip.AddrPortFrom(targetAddr, targetPort)
+		li.ARPChan <- ARPEntry{
+			IPAddress:  targetIPAddr,
+			MACAddress: targetMACAddr,
+		}
+	}
 }
 
 // Given payload, destination IP address and IP Header, send the packet to the
@@ -103,6 +225,11 @@ func (li *Link) ListenAtInterface(packetChan chan *packet.Packet, errorChan chan
 		}
 		if !li.IsUp {
 			// Don't recv
+			continue
+		}
+		// Before we proceed, we check if the received bytes are arp message or not
+		if IsThisARPPacket(buf) {
+			li.HandleARPMessage(buf)
 			continue
 		}
 		header, err := util.ParseHeader(buf)

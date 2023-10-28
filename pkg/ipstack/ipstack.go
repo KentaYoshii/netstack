@@ -86,20 +86,24 @@ func (ip *IpStack) Initialize(config *util.IPConfig) {
 	for _, i := range config.Interfaces {
 		ip.NameToPrefix[i.Name] = i.AssignedPrefix
 		ip.Subnets[i.AssignedPrefix] = &link.Link{
-			IPAddr:        i.AssignedIP,
-			ListenAddr:    i.UDPAddr,
-			ARPTable:      make(map[netip.Addr]netip.AddrPort, 0),
-			InterfaceName: i.Name,
-			IsUp:          true,
-			Subnet:        i.AssignedPrefix,
-			ErrorChan:     ip.errorChan,
+			IPAddr:         i.AssignedIP,
+			ListenAddr:     i.UDPAddr,
+			ARPTable:       make(map[netip.Addr]netip.AddrPort, 0),
+			BroadCastAddrs: make([]netip.AddrPort, 0),
+			InterfaceName:  i.Name,
+			IsUp:           true,
+			Subnet:         i.AssignedPrefix,
+			ErrorChan:      ip.errorChan,
+			InfoChan:       ip.InfoChan,
+			ARPChan:        make(chan link.ARPEntry, 100),
 		}
 	}
-	// =============== ARP Table ===============
+	// Populate BroadcastAddrs for ARP protocol
 	for _, n := range config.Neighbors {
 		for prefix, li := range ip.Subnets {
 			if prefix.Contains(n.DestAddr) {
-				li.AddNeighbor(n.DestAddr, n.UDPAddr)
+				li.AddNeighbor(n.UDPAddr)
+				break
 			}
 		}
 	}
