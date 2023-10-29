@@ -1,11 +1,16 @@
-package socket
+package socket_api
 
 import (
-    "net/netip"
+	"errors"
+	"net/netip"
+	"netstack/pkg/proto"
+	"netstack/pkg/socket"
 )
 
 type VTCPListener struct {
-
+    SID   int
+    Laddr netip.Addr // Addr we are listening at
+    Lport uint16 // Port we are listening at 
 }
 
 type VTCPConn struct {
@@ -18,7 +23,24 @@ type VTCPConn struct {
 // After binding, the listening socket moves into LISTEN state
 // Returns the listening socket or error 
 func VListen(port uint16) (*VTCPListener, error) {
-	return &VTCPListener{}, nil
+    if !proto.BindPort(int(port)) {
+        // Port already bound
+        return &VTCPListener{}, errors.New("Port already in use")
+    }
+    // Allocate new socket id
+    sid := proto.AllocSID()
+    // Create TCB for the Listen Socket
+    tcb := socket.CreateTCBForListenSocket(sid, port)
+    // Create Key for TCB
+    key := proto.CreateSocketTableKey(true, netip.Addr{}, port, netip.Addr{}, 0)
+    // Add to socket table
+    proto.AddSocketToTable(key, tcb)
+    // Return listen socket
+	return &VTCPListener{
+        SID: sid,
+        Laddr: key.Laddr,
+        Lport: port,
+    }, nil
 }
 
 // VAccept waits for new TCP connections on the given listening socket

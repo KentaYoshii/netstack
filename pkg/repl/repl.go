@@ -9,8 +9,10 @@ import (
 	"netstack/pkg/packet"
 	"netstack/pkg/proto"
 	"netstack/pkg/socket"
+	"netstack/pkg/socket_api"
 	"netstack/pkg/util"
 	"os"
+	"sort"
 	"strconv"
 	"strings"
 )
@@ -100,7 +102,7 @@ func (r *Repl) StartREPL() {
 		handler, ok := r.CommandHandlerMap[tokens[0]]
 		if !ok {
 			// No handler
-			r.WriteOutput("Command not supported. Type help to see the supported commands\n", false)
+			r.HostInfo.Logger.Error("Command not supported. Type help to see the supported commands")
 			continue
 		}
 		// Handle
@@ -119,11 +121,30 @@ func (r *Repl) handleSocketListenAndAccept(args []string) string {
 	var b strings.Builder
 
 	if len(args) != 2 {
-		b.WriteString("Usage: a <port>")
-		return b.String()
+		r.HostInfo.Logger.Error("Usage: a <port>")
+		return ""
 	}
 
-	return ""
+	port, err := strconv.Atoi(args[1])
+	if err != nil {
+		r.HostInfo.Logger.Error(err.Error())
+		return ""
+	}
+
+	if port < 0 || port > 65535 {
+		r.HostInfo.Logger.Error("Invalid range for port number")
+		return ""
+	}
+
+	// Create Listen Socket
+	listenSock, err := socket_api.VListen(uint16(port))
+	if err != nil {
+		r.HostInfo.Logger.Error(err.Error())
+		return ""
+	}
+
+	b.WriteString(fmt.Sprintf("Created listen socket with SID=%d\n", listenSock.SID))
+	return b.String()
 }
 
 // Handle "c" command (c <ip> <port>)
@@ -132,11 +153,11 @@ func (r *Repl) handleSocketConnect(args []string) string {
 	var b strings.Builder
 
 	if len(args) != 3 {
-		b.WriteString("Usage: c <ip> <port>")
-		return b.String()
+		r.HostInfo.Logger.Error("Usage: c <ip> <port>")
+		return ""
 	}
 
-	return ""
+	return b.String()
 }
 
 // Handle "s" command (s <sid> <payload>)
@@ -145,11 +166,11 @@ func (r *Repl) handleSocketSend(args []string) string {
 	var b strings.Builder
 
 	if len(args) != 3 {
-		b.WriteString("Usage: s <sid> <payload>")
-		return b.String()
+		r.HostInfo.Logger.Error("Usage: s <sid> <payload>")
+		return ""
 	}
 
-	return ""
+	return b.String()
 }
 
 // Handle "r" command (r <sid> <numbytes>)
@@ -158,11 +179,11 @@ func (r *Repl) handleSocketReceive(args []string) string {
 	var b strings.Builder
 
 	if len(args) != 3 {
-		b.WriteString("Usage: r <sid> <numbytes>")
-		return b.String()
+		r.HostInfo.Logger.Error("Usage: r <sid> <numbytes>")
+		return ""
 	}
 
-	return ""
+	return b.String()
 }
 
 // Handle "cl" command (cl <sid>)
@@ -171,11 +192,11 @@ func (r *Repl) handleSocketClose(args []string) string {
 	var b strings.Builder
 
 	if len(args) != 2 {
-		b.WriteString("Usage: cl <sid>")
-		return b.String()
+		r.HostInfo.Logger.Error("Usage: cl <sid>")
+		return ""
 	}
 
-	return ""
+	return b.String()
 }
 
 // Handle "ls" command (ls)
@@ -184,18 +205,27 @@ func (r *Repl) handleSocketList(args []string) string {
 	var b strings.Builder
 
 	if len(args) != 1 {
-		b.WriteString("Usage: ls")
-		return b.String()
+		r.HostInfo.Logger.Error("Usage: ls")
+		return ""
 	}
 
-	proto.SocketTable.StMtx.Lock()
-	defer proto.SocketTable.StMtx.Unlock()
+	proto.TCPStack.StMtx.Lock()
+	defer proto.TCPStack.StMtx.Unlock()
+
+	sids := make([]int, 0)
+	for k := range proto.TCPStack.SIDToTableKey {
+		sids = append(sids, k)
+	}
+
+	sort.Ints(sids)
 
 	b.WriteString(fmt.Sprintf("%-4s%-15s%-7s%-15s%-7s%-10s\n", "---", "-----", "-----", "-----", "-----", "------"))
 	b.WriteString(fmt.Sprintf("%-4s%-15s%-7s%-15s%-7s%-10s\n", "SID", "LAddr", "LPort", "RAddr", "RPort", "Status"))
 	b.WriteString(fmt.Sprintf("%-4s%-15s%-7s%-15s%-7s%-10s\n", "---", "-----", "-----", "-----", "-----", "------"))
 
-	for _, tcb := range proto.SocketTable.Table {
+	for _, sid := range sids {
+		key := proto.TCPStack.SIDToTableKey[sid]
+		tcb := proto.TCPStack.SocketTable[key]
 		b.WriteString(fmt.Sprintf("%-4d%-15s%-7d%-15s%-7d%-10s\n",
 			tcb.SID, tcb.Laddr.String(), tcb.Lport, tcb.Raddr.String(), tcb.Rport, socket.ToSocketStateStr(tcb.State)))
 	}
@@ -209,10 +239,10 @@ func (r *Repl) handleSocketSendFile(args []string) string {
 	var b strings.Builder
 
 	if len(args) != 4 {
-		b.WriteString("Usage: sf <file path> <ip addr> <port>")
-		return b.String()
+		r.HostInfo.Logger.Error("Usage: sf <file path> <ip addr> <port>")
+		return ""
 	}
-	return ""
+	return b.String()
 }
 
 // Handle "rf" command (rf <dest file path> <port>)
@@ -221,10 +251,10 @@ func (r *Repl) handleSocketReceiveFile(args []string) string {
 	var b strings.Builder
 
 	if len(args) != 3 {
-		b.WriteString("Usage: rf <dest file path> <port>")
-		return b.String()
+		r.HostInfo.Logger.Error("Usage: rf <dest file path> <port>")
+		return ""
 	}
-	return ""
+	return b.String()
 }
 
 // ============= Handler Functions (IP) ============
@@ -347,25 +377,25 @@ func (r *Repl) handleHelp(args []string) string {
 func (r *Repl) handleSend(args []string) string {
 	var b strings.Builder
 	if len(args) < 3 {
-		b.WriteString("Usage:  send <dest ip> <message>\n")
-		return b.String()
+		r.HostInfo.Logger.Error("Usage:  send <dest ip> <message>")
+		return ""
 	}
 	destAddr, err := netip.ParseAddr(args[1])
 	if err != nil {
-		b.WriteString(err.Error())
-		return b.String()
+		r.HostInfo.Logger.Error(err.Error())
+		return ""
 	}
 	// Get the payload
 	payloadString := strings.Join(args[2:], " ")
 	link, valid := r.HostInfo.GetOutgoingLink(destAddr)
 	if !valid {
-		return b.String()
+		return ""
 	}
 	newPacket := packet.CreateNewPacket([]byte(payloadString), link.IPAddr, destAddr, util.TEST_PROTO, util.DEFAULT_TTL)
 	err = r.HostInfo.SendPacket(newPacket, false)
 	if err != nil {
-		b.WriteString(err.Error())
-		return b.String()
+		r.HostInfo.Logger.Error(err.Error())
+		return ""
 	}
 	b.WriteString(fmt.Sprintf("Sent %d bytes!\n", len(payloadString)))
 	return b.String()
@@ -375,16 +405,16 @@ func (r *Repl) handleSend(args []string) string {
 func (r *Repl) handleUp(args []string) string {
 	var b strings.Builder
 	if len(args) != 2 {
-		b.WriteString("Usage:  up <if name>\n")
-		return b.String()
+		r.HostInfo.Logger.Error("Usage: up <if name>")
+		return ""
 	}
 	target := args[1]
 	for prefix, li := range r.HostInfo.Subnets {
 		if li.InterfaceName == target {
 			if li.IsUp {
 				// no op
-				b.WriteString("Interface is already up\n")
-				return b.String()
+				r.HostInfo.Logger.Error("Interface is already up")
+				return ""
 			}
 			li.IsUp = true
 
@@ -407,24 +437,24 @@ func (r *Repl) handleUp(args []string) string {
 			return b.String()
 		}
 	}
-	b.WriteString(target + " not found\n")
-	return b.String()
+	r.HostInfo.Logger.Error(target + " not found")
+	return ""
 }
 
 // Handle "down" command
 func (r *Repl) handleDown(args []string) string {
 	var b strings.Builder
 	if len(args) != 2 {
-		b.WriteString("Usage:  down <if name>\n")
-		return b.String()
+		r.HostInfo.Logger.Error("Usage: down <if name>")
+		return ""
 	}
 	target := args[1]
 	for prefix, li := range r.HostInfo.Subnets {
 		if li.InterfaceName == target {
 			if !li.IsUp {
 				// no op
-				b.WriteString("Interface is already down\n")
-				return b.String()
+				r.HostInfo.Logger.Error("Interface is already down")
+				return ""
 			}
 			li.IsUp = false
 
@@ -447,21 +477,21 @@ func (r *Repl) handleDown(args []string) string {
 			return b.String()
 		}
 	}
-	b.WriteString(target + " not found\n")
-	return b.String()
+	r.HostInfo.Logger.Error(target + " not found")
+	return ""
 }
 
 // Handle "tracert" command
 func (r *Repl) handleTraceRt(args []string) string {
 	var b strings.Builder
 	if len(args) != 2 {
-		b.WriteString("Usage: tracert <ip address>\n")
-		return b.String()
+		r.HostInfo.Logger.Error("Usage: tracert <ip address>")
+		return ""
 	}
 	destAddr, err := netip.ParseAddr(args[1])
 	if err != nil {
-		b.WriteString(err.Error())
-		return b.String()
+		r.HostInfo.Logger.Error(err.Error())
+		return ""
 	}
 	b.WriteString(fmt.Sprintf("traceroute to %s, %d hops max, 4 bytes packet\n", destAddr.String(), proto.INF))
 	res := make(chan proto.TraceRouteInfo, 100)
@@ -485,18 +515,18 @@ func (r *Repl) handleTraceRt(args []string) string {
 func (r *Repl) handlePing(args []string) string {
 	var b strings.Builder
 	if len(args) != 3 {
-		b.WriteString("Usage: ping <count> <ip address>\n")
-		return b.String()
+		r.HostInfo.Logger.Error("Usage: ping <count> <ip address>")
+		return ""
 	}
 	cnt, err := strconv.Atoi(args[1])
 	if err != nil {
-		b.WriteString(err.Error())
-		return b.String()
+		r.HostInfo.Logger.Error(err.Error())
+		return ""
 	}
 	destAddr, err := netip.ParseAddr(args[2])
 	if err != nil {
-		b.WriteString(err.Error())
-		return b.String()
+		r.HostInfo.Logger.Error(err.Error())
+		return ""
 	}
 	b.WriteString(fmt.Sprintf("PING %s: 4 data bytes\n", destAddr.String()))
 	res := make(chan proto.PingInfo, 100)
@@ -535,8 +565,8 @@ func (r *Repl) handlePing(args []string) string {
 func (r *Repl) handleSetLog(args []string) string {
 	var b strings.Builder
 	if len(args) != 2 {
-		b.WriteString("Usage: setlog <debug|info|warn|error>\n")
-		return b.String()
+		r.HostInfo.Logger.Error("Usage: setlog <debug|info|warn|error>")
+		return ""
 	}
 	switch args[1] {
 	case "debug":
@@ -577,9 +607,9 @@ func (r *Repl) handleSetLog(args []string) string {
 		}
 	default:
 		{
-			b.WriteString("Usage: setlog <debug|info|warn|error>\n")
-			return b.String()
+			r.HostInfo.Logger.Error("Usage: setlog <debug|info|warn|error>")
+			return ""
 		}
 	}
-	return ""
+	return b.String()
 }

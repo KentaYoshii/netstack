@@ -34,6 +34,18 @@ const (
 
 // ============= Helper ==============
 
+// Create TCB for Listen Socket
+func CreateTCBForListenSocket(sid int, port uint16) *TCB {
+    return &TCB{
+        SID: sid,
+        State: LISTEN,
+        Laddr: netip.MustParseAddr("0.0.0.0"),
+        Lport: port,
+        Raddr: netip.MustParseAddr("0.0.0.0"),
+        Rport: 0,
+    }
+}
+
 // Given Socket State in int, return the string representation of it
 func ToSocketStateStr(state SocketState) string {
 	switch state {

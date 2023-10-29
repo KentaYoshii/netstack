@@ -149,7 +149,7 @@ func (ip *IpStack) Initialize(config *util.IPConfig) {
 	} else {
 		// if host, initialize socket table
 		ip.RipEnabled = false
-		proto.InitializeSocketTable()
+		proto.InitializeTCPStack()
 	}
 
 	// ================== RIP ==================
