@@ -2,9 +2,9 @@ package socket_api
 
 import (
 	"errors"
+	"fmt"
 	"net/netip"
 	"netstack/pkg/proto"
-    "fmt"
 	"netstack/pkg/socket"
 	"netstack/pkg/util"
 )
@@ -68,6 +68,7 @@ func (li *VTCPListener) VAccept() {
 		// 2. Add the new socket to socket table
 		// 3. Update the connection state variables of the new TCB
 		// 4. Invoke the subroutine to proceed with the handshake
+        // 5. Once the 3-way Handshake is done dispatch the socket
 
 		// 1
 		sid := proto.AllocSID()
@@ -89,6 +90,8 @@ func (li *VTCPListener) VAccept() {
 			if suc {
 				// Connection is established!
 				li.InfoChan <- fmt.Sprintf("New connection on SID=%d => Created new socket with SID=%d", li.TCB.SID, newTCB.SID)
+				// Dispatch this socket
+				go _doSocket(newTCB)
 				break
 			}
 		}
@@ -117,6 +120,7 @@ func VConnect(laddr netip.Addr, raddr netip.Addr, rport uint16) (*VTCPConn, erro
 	// 2. Add the new socket to socket table
 	// 3. Update the connection state variables of the new TCB
 	// 4. Invoke the subroutine to proceed with the handshake
+    // 5. Once the 3-way handshake is done, dispatch the socket
 
 	// 1
 	lport := util.GetPort()
@@ -128,7 +132,7 @@ func VConnect(laddr netip.Addr, raddr netip.Addr, rport uint16) (*VTCPConn, erro
 	proto.AddSocketToTable(key, tcb)
 	// 3
 	tcb.State = socket.SYN_SENT
-    tcb.ISS = iss
+	tcb.ISS = iss
 	tcb.SND_UNA = iss
 	tcb.SND_NXT = iss + 1
 	// 4
@@ -136,12 +140,15 @@ func VConnect(laddr netip.Addr, raddr netip.Addr, rport uint16) (*VTCPConn, erro
 		suc := _activeHandShake(tcb)
 		if suc {
 			// SYN was ACK'ed
-			break
+            // Dispatch this socket
+            go _doSocket(tcb)
+            // Return the conn
+			return &VTCPConn{
+				TCB: tcb,
+			}, nil
 		}
 	}
-	return &VTCPConn{
-		TCB: tcb,
-	}, nil
+	return &VTCPConn{}, errors.New("VConnect(): Destionation port does not exist")
 }
 
 // Reads data from the TCP socket. Data is read into "buf"

@@ -46,12 +46,18 @@ func _passiveHandshake(tcb *proto.TCB) bool {
 			}
 		case reply := <-tcb.ReceiveChan:
 			{
+                // If we see a SYN flag, return and sent SYN, ACK
+                if reply.TCPHeader.Flags&util.SYN != 0 {
+                    return false
+                }
+                
 				// 3.10.7.4
 				// First perform the Segment acceptability test
 				if !tcb.IsSegmentValid(reply) {
+                    var flag = util.ACK
 					// If invalid send ACK in reply
 					// <SEQ=SND.NXT><ACK=RCV.NXT><CTL=ACK>
-					hdr := util.CreateTCPHeader(tcb.Lport, tcb.Rport, tcb.SND_NXT, tcb.RCV_NXT, DEFAULT_DATAOFFSET, util.ACK, uint16(tcb.RCV_WND))
+					hdr := util.CreateTCPHeader(tcb.Lport, tcb.Rport, tcb.SND_NXT, tcb.RCV_NXT, DEFAULT_DATAOFFSET, uint8(flag), uint16(tcb.RCV_WND))
 					tcpPacket := &proto.TCPPacket{
 						LAddr:     tcb.Laddr,
 						RAddr:     tcb.Raddr,
@@ -169,6 +175,32 @@ func _activeHandShake(tcb *proto.TCB) bool {
 				tcb.SendChan <- tcpPacket
 				// Handshake is complete
 				return true
+			}
+		}
+	}
+}
+
+// Function that do things socket is meant to do
+// When entering this state, socket is in ESTABLISHED state
+func _doSocket(tcb *proto.TCB) {
+	for {
+		select {
+		case tcpPacket := <-tcb.ReceiveChan:
+			{
+                // First perform the Segment acceptability test
+				if !tcb.IsSegmentValid(tcpPacket) {
+					// If invalid send ACK in reply
+					// <SEQ=SND.NXT><ACK=RCV.NXT><CTL=ACK>
+					hdr := util.CreateTCPHeader(tcb.Lport, tcb.Rport, tcb.SND_NXT, tcb.RCV_NXT, DEFAULT_DATAOFFSET, util.ACK, uint16(tcb.RCV_WND))
+					tcpPacket := &proto.TCPPacket{
+						LAddr:     tcb.Laddr,
+						RAddr:     tcb.Raddr,
+						TCPHeader: hdr,
+						Payload:   []byte{},
+					}
+					tcb.SendChan <- tcpPacket
+					continue
+				}
 			}
 		}
 	}
