@@ -18,6 +18,11 @@ type VTCPConn struct {
 	TCB *proto.TCB
 }
 
+// Maps of SIDs to Conns
+// Used in our REPL for easy access to sockets
+var SIDToListenSock map[int]*VTCPListener = make(map[int]*VTCPListener)
+var SIDToNormalSock map[int]*VTCPConn = make(map[int]*VTCPConn)
+
 // ================= VTCPListener ====================
 
 // PASSIVE_OPEN
@@ -68,7 +73,8 @@ func (li *VTCPListener) VAccept() {
 		// 2. Add the new socket to socket table
 		// 3. Update the connection state variables of the new TCB
 		// 4. Invoke the subroutine to proceed with the handshake
-        // 5. Once the 3-way Handshake is done dispatch the socket
+		// 5. Once the 3-way Handshake is done dispatch the socket
+        //    - If fails, remove the alloc'ed TCB
 
 		// 1
 		sid := proto.AllocSID()
@@ -90,12 +96,17 @@ func (li *VTCPListener) VAccept() {
 			if suc {
 				// Connection is established!
 				li.InfoChan <- fmt.Sprintf("New connection on SID=%d => Created new socket with SID=%d", li.TCB.SID, newTCB.SID)
-				// Dispatch this socket
+				// Add to mapping
+				SIDToNormalSock[newTCB.SID] = &VTCPConn{
+					newTCB,
+				}
+				// 5 
 				go _doSocket(newTCB)
 				break
 			}
 		}
-
+        // If failed, remove the TCB 
+        proto.RemoveSocketFromTable(key)
 	}
 }
 
@@ -103,6 +114,11 @@ func (li *VTCPListener) VAccept() {
 // No new connection may be made on this socket.
 // Returns eror if closing fails
 func (li *VTCPListener) VClose() error {
+	// First close the receive chan so no new SYN packet is received
+	close(li.TCB.ReceiveChan)
+	// Remove
+	key := proto.CreateSocketTableKey(true, netip.Addr{}, li.TCB.Lport, netip.Addr{}, 0)
+	proto.RemoveSocketFromTable(key)
 	return nil
 }
 
@@ -118,17 +134,23 @@ func VConnect(laddr netip.Addr, raddr netip.Addr, rport uint16) (*VTCPConn, erro
 	// Active Open
 	// 1. Allocate port, SID, ISN, and TCB
 	// 2. Add the new socket to socket table
+	//    - If key already exists, try another port
 	// 3. Update the connection state variables of the new TCB
 	// 4. Invoke the subroutine to proceed with the handshake
-    // 5. Once the 3-way handshake is done, dispatch the socket
+	// 5. Once the 3-way handshake is done, dispatch the socket
 
 	// 1
-	lport := util.GetPort()
 	sid := proto.AllocSID()
+retry:
+	lport := util.GetPort()
 	iss := util.GetNewISN(proto.TCPStack.ISNCTR, laddr, lport, raddr, rport)
 	tcb := proto.CreateTCBForNormalSocket(sid, laddr, lport, raddr, rport)
-	// 2
 	key := proto.CreateSocketTableKey(false, laddr, lport, raddr, rport)
+	// 2
+	_, found := proto.SocketTableLookup(key)
+	if found {
+		goto retry
+	}
 	proto.AddSocketToTable(key, tcb)
 	// 3
 	tcb.State = socket.SYN_SENT
@@ -140,14 +162,17 @@ func VConnect(laddr netip.Addr, raddr netip.Addr, rport uint16) (*VTCPConn, erro
 		suc := _activeHandShake(tcb)
 		if suc {
 			// SYN was ACK'ed
-            // Dispatch this socket
-            go _doSocket(tcb)
-            // Return the conn
+			// Dispatch this socket
+			go _doSocket(tcb)
+			// Return the conn
 			return &VTCPConn{
 				TCB: tcb,
 			}, nil
 		}
 	}
+
+    // Remove TCB
+    proto.RemoveSocketFromTable(key)
 	return &VTCPConn{}, errors.New("VConnect(): Destionation port does not exist")
 }
 

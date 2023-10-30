@@ -46,11 +46,11 @@ func _passiveHandshake(tcb *proto.TCB) bool {
 			}
 		case reply := <-tcb.ReceiveChan:
 			{
-                // If we see a SYN flag, return and sent SYN, ACK
+                // If we see a SYN flag, return and send SYN, ACK
                 if reply.TCPHeader.Flags&util.SYN != 0 {
                     return false
                 }
-                
+
 				// 3.10.7.4
 				// First perform the Segment acceptability test
 				if !tcb.IsSegmentValid(reply) {

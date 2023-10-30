@@ -187,6 +187,15 @@ func AddSocketToTable(key SocketTableKey, value *TCB) {
 	TCPStack.SIDToTableKey[value.SID] = key
 }
 
+// Remove Socket from Table
+func RemoveSocketFromTable(key SocketTableKey) {
+    tcb := TCPStack.SocketTable[key]
+    // Remove from SID to Key map
+    delete(TCPStack.SIDToTableKey, tcb.SID)
+    // Remove from actual Socket Table
+    delete(TCPStack.SocketTable, key)
+}
+
 // Given a port, bind to that port
 func BindPort(toBind int) bool {
 	if _, ok := TCPStack.BoundPorts[toBind]; ok {
@@ -229,6 +238,14 @@ func HandleTCPProtocol(packet *packet.Packet, l *slog.Logger) {
 	tcpHdr := util.ParseTCPHeader(packet.Payload)
 	// Assume for now, no options are used
 	payload := packet.Payload[tcpHdr.DataOffset:]
+	// Verify TCP Checksum
+	fromHdr := tcpHdr.Checksum
+	tcpHdr.Checksum = 0
+	computedChecksum := util.ComputeTCPChecksum(&tcpHdr, packet.IPHeader.Src, packet.IPHeader.Dst, payload)
+    if fromHdr != computedChecksum {
+        l.Error("TCP Checusum is wrong")
+        return
+    }
 	// Construct TCP Packet
 	tcpPacket := &TCPPacket{
 		LAddr:     packet.IPHeader.Dst,
@@ -252,6 +269,8 @@ func HandleTCPProtocol(packet *packet.Packet, l *slog.Logger) {
 	if found {
 		// Should be SYN packet
 		tcb.ReceiveChan <- tcpPacket
+        return
 	}
-	// TODO: ICMP Unreachable message might make sense here
+	
+    l.Info("Received TCP Packet destined to unknown application")
 }
