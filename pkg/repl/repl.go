@@ -88,6 +88,11 @@ func (r *Repl) StartREPL() {
 		r.RegisterCommandHandler("rf", r.handleSocketReceiveFile)
 	}
 
+	// Testing only
+	if r.HostInfo.RipEnabled {
+		r.RegisterCommandHandler("lossy", r.handleLossy)
+	}
+
 	for r.Scanner.Scan() {
 		// Split
 		tokens := strings.Fields(r.Scanner.Text())
@@ -297,6 +302,26 @@ func (r *Repl) handleSocketReceiveFile(args []string) string {
 }
 
 // ============= Handler Functions (IP) ============
+
+// Handle "lossy" command
+func (r *Repl) handleLossy(args []string) string {
+	
+	if len(args) != 2 {
+		r.HostInfo.Logger.Error("Usage: lossy <rate>")
+		return ""
+	}
+	rate, err := strconv.ParseFloat(args[1], 32)
+	if err != nil {
+		r.HostInfo.Logger.Error(err.Error())
+		return ""
+	}
+	if rate > 1 || rate < 0 {
+		r.HostInfo.Logger.Error("Rate should be within 0 and 1.0")
+		return ""
+	}
+	r.HostInfo.LossRate = rate
+	return ""
+}
 
 // Handle "info" command
 func (r *Repl) handleInfo(args []string) string {

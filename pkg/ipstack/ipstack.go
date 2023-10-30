@@ -22,6 +22,8 @@ type IPStack struct {
 
 	// RIP enabled?
 	RipEnabled bool
+	// TEST ONLY
+	LossRate float64
 
 	// Maps
 
@@ -64,6 +66,7 @@ func CreateIPStack() *IPStack {
 			},
 		})),
 		RipEnabled:         false,
+		LossRate:          0.0,
 		Subnets:            make(map[netip.Prefix]*link.Link),
 		ProtocolHandlerMap: make(map[uint8]ProtocolHandler),
 		ForwardingTable:    make(map[netip.Prefix]proto.NextHop),
@@ -368,6 +371,15 @@ func (ip *IPStack) ProcessPackets() {
 				ip.SendICMP(packet, proto.TIME_EXCEEDED, proto.TIME_EXCEEDED_TTL)
 				continue
 			}
+
+			// For Lossy Router
+			if ip.LossRate != 0.0 {
+				// Drop the packet
+				if util.GenRandNum() < ip.LossRate {
+					continue
+				}
+			}
+
 			// Send Packet to next hop
 			err := ip.SendPacket(packet, true)
 			if err != nil {

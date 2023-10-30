@@ -3,11 +3,12 @@ package util
 import (
 	"bytes"
 	"encoding/binary"
+	"errors"
 	"fmt"
+	"math/rand"
 	"net"
 	"net/netip"
 	"strings"
-	"errors"
 
 	"github.com/google/netstack/tcpip/header"
 	"github.com/praserx/ipconv"
@@ -34,7 +35,7 @@ const (
 	HOP_STATIC
 )
 
-// Convert netip.Addr to net.IP 
+// Convert netip.Addr to net.IP
 func IPAddrToNetIP(convAddr netip.Addr) (net.IP, error) {
 	addr := net.ParseIP(convAddr.String())
 	if addr == nil {
@@ -42,6 +43,7 @@ func IPAddrToNetIP(convAddr netip.Addr) (net.IP, error) {
 	}
 	return addr, nil
 }
+
 // Given "nn" representing IP Address in uint32, return
 // corresponding IP Address
 func Int2ip(nn uint32) net.IP {
@@ -119,4 +121,9 @@ func ExtractIdSeq(from []byte) (uint16, uint16) {
 	id := binary.BigEndian.Uint16(from[0:2])
 	seq := binary.BigEndian.Uint16(from[2:4])
 	return id, seq
+}
+
+// Get random float within 0 and 1.0
+func GenRandNum() float64 {
+	return float64(rand.Intn(101)) / float64(100)
 }

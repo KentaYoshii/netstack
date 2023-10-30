@@ -22,16 +22,16 @@ const (
 // - Either timeouts and return false
 // - Receive a packet
 //   - Check if segment is acceptable or not
-//     - Send ACK if not and drop the segment
+//   - Send ACK if not and drop the segment
 //   - Check if ACK is set
-//     - Drop if not
+//   - Drop if not
 func _passiveHandshake(tcb *proto.TCB) bool {
 	// Send SYN, ACK
 	// <SEQ=ISS><ACK=RCV.NXT><CTL=SYN,ACK>
 	hdr := util.CreateTCPHeader(tcb.Lport, tcb.Rport, tcb.ISS, tcb.RCV_NXT, DEFAULT_DATAOFFSET, util.SYN|util.ACK, uint16(tcb.RCV_WND))
 	tcpPacket := &proto.TCPPacket{
-        LAddr: tcb.Laddr,
-        RAddr: tcb.Raddr,
+		LAddr:     tcb.Laddr,
+		RAddr:     tcb.Raddr,
 		TCPHeader: hdr,
 		Payload:   []byte{},
 	}
@@ -53,39 +53,39 @@ func _passiveHandshake(tcb *proto.TCB) bool {
 					// <SEQ=SND.NXT><ACK=RCV.NXT><CTL=ACK>
 					hdr := util.CreateTCPHeader(tcb.Lport, tcb.Rport, tcb.SND_NXT, tcb.RCV_NXT, DEFAULT_DATAOFFSET, util.ACK, uint16(tcb.RCV_WND))
 					tcpPacket := &proto.TCPPacket{
-                        LAddr: tcb.Laddr,
-                        RAddr: tcb.Raddr,
+						LAddr:     tcb.Laddr,
+						RAddr:     tcb.Raddr,
 						TCPHeader: hdr,
 						Payload:   []byte{},
 					}
 					tcb.SendChan <- tcpPacket
-                    continue
+					continue
 				}
 
-                // Check if ACK is set
-                if reply.TCPHeader.Flags&util.ACK == 0 {
-                    // not set
-                    continue
-                }
+				// Check if ACK is set
+				if reply.TCPHeader.Flags&util.ACK == 0 {
+					// not set
+					continue
+				}
 
-                SEG_ACK := reply.TCPHeader.AckNum
+				SEG_ACK := reply.TCPHeader.AckNum
 
-                // Check if it is ACK for our SYN, ACK
-                if !(tcb.SND_UNA < SEG_ACK && SEG_ACK <= tcb.SND_NXT) {
-                    // ACK not for our SYN, ACK packet
-                    continue
-                } 
+				// Check if it is ACK for our SYN, ACK
+				if !(tcb.SND_UNA < SEG_ACK && SEG_ACK <= tcb.SND_NXT) {
+					// ACK not for our SYN, ACK packet
+					continue
+				}
 
-                // Update state
-                tcb.State = socket.ESTABLISHED
-                
-                // Set the connection state variables
-                tcb.SND_WND = uint32(reply.TCPHeader.WindowSize)
-                tcb.SND_WL1 = reply.TCPHeader.SeqNum
-                tcb.SND_WL2 = reply.TCPHeader.AckNum
-                
-                return true
-                // TODO: Check if the FIN bit is set
+				// Update state
+				tcb.State = socket.ESTABLISHED
+
+				// Set the connection state variables
+				tcb.SND_WND = uint32(reply.TCPHeader.WindowSize)
+				tcb.SND_WL1 = reply.TCPHeader.SeqNum
+				tcb.SND_WL2 = reply.TCPHeader.AckNum
+
+				return true
+				// TODO: Check if the FIN bit is set
 			}
 		}
 
@@ -112,8 +112,8 @@ func _activeHandShake(tcb *proto.TCB) bool {
 	// <SEQ=ISS><CTL=SYN>
 	hdr := util.CreateTCPHeader(tcb.Lport, tcb.Rport, tcb.ISS, 0, DEFAULT_DATAOFFSET, util.SYN, uint16(tcb.RCV_WND))
 	tcpPacket := &proto.TCPPacket{
-        LAddr: tcb.Laddr,
-        RAddr: tcb.Raddr,
+		LAddr:     tcb.Laddr,
+		RAddr:     tcb.Raddr,
 		TCPHeader: hdr,
 		Payload:   []byte{},
 	}
@@ -160,8 +160,8 @@ func _activeHandShake(tcb *proto.TCB) bool {
 				// <SEQ=SND.NXT><ACK=RCV.NXT><CTL=ACK>
 				hdr = util.CreateTCPHeader(tcb.Lport, tcb.Rport, tcb.SND_NXT, tcb.RCV_NXT, DEFAULT_DATAOFFSET, util.ACK, uint16(tcb.RCV_WND))
 				tcpPacket := &proto.TCPPacket{
-                    LAddr: tcb.Laddr,
-                    RAddr: tcb.Raddr,
+					LAddr:     tcb.Laddr,
+					RAddr:     tcb.Raddr,
 					TCPHeader: hdr,
 					Payload:   []byte{},
 				}
