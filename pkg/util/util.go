@@ -7,6 +7,7 @@ import (
 	"net"
 	"net/netip"
 	"strings"
+	"errors"
 
 	"github.com/google/netstack/tcpip/header"
 	"github.com/praserx/ipconv"
@@ -22,9 +23,6 @@ const (
 	ICMP_PROTO = 1
 	TCP_PROTO  = 6
 	RIP_PROTO  = 200
-
-	// Retransmission
-	MAX_RETRANS = 3
 )
 
 type HopType int
@@ -36,6 +34,14 @@ const (
 	HOP_STATIC
 )
 
+// Convert netip.Addr to net.IP 
+func IPAddrToNetIP(convAddr netip.Addr) (net.IP, error) {
+	addr := net.ParseIP(convAddr.String())
+	if addr == nil {
+		return nil, errors.New("error parsing IP")
+	}
+	return addr, nil
+}
 // Given "nn" representing IP Address in uint32, return
 // corresponding IP Address
 func Int2ip(nn uint32) net.IP {

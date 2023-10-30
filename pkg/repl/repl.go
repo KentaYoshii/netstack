@@ -27,7 +27,7 @@ type Repl struct {
 	// Map from Command to Command Handler
 	CommandHandlerMap map[string]ReplHandler
 	// Host Info
-	HostInfo *ipstack.IpStack
+	HostInfo *ipstack.IPStack
 	// Writer
 	Writer *bufio.Writer
 	// Scanner
@@ -35,7 +35,7 @@ type Repl struct {
 }
 
 // Initialize our REPL
-func CreateREPL(ipstack *ipstack.IpStack) *Repl {
+func CreateREPL(ipstack *ipstack.IPStack) *Repl {
 	return &Repl{
 		CommandHandlerMap: make(map[string]ReplHandler),
 		HostInfo:          ipstack,
@@ -136,14 +136,20 @@ func (r *Repl) handleSocketListenAndAccept(args []string) string {
 		return ""
 	}
 
-	// Create Listen Socket
+	// Create Listen Socket (Passive Open)
 	listenSock, err := socket_api.VListen(uint16(port))
 	if err != nil {
 		r.HostInfo.Logger.Error(err.Error())
 		return ""
 	}
 
-	b.WriteString(fmt.Sprintf("Created listen socket with SID=%d\n", listenSock.SID))
+	// For announcing new connections
+	listenSock.InfoChan = r.HostInfo.InfoChan
+
+	// Start accepting
+	go listenSock.VAccept()
+
+	b.WriteString(fmt.Sprintf("Created listen socket with SID=%d\n", listenSock.TCB.SID))
 	return b.String()
 }
 
@@ -157,6 +163,39 @@ func (r *Repl) handleSocketConnect(args []string) string {
 		return ""
 	}
 
+	// Verify IP
+	ipAddr, err := netip.ParseAddr(args[1])
+	if err != nil {
+		r.HostInfo.Logger.Error(err.Error())
+		return ""
+	}
+
+	// Verify Port
+	port, err := strconv.Atoi(args[2])
+	if err != nil {
+		r.HostInfo.Logger.Error(err.Error())
+		return ""
+	}
+
+	if port < 0 || port > 65535 {
+		r.HostInfo.Logger.Error("Invalid range for port number")
+		return ""
+	}
+
+	// Get outgoing ip
+	link, valid := r.HostInfo.GetOutgoingLink(ipAddr)
+	if !valid {
+		return ""
+	}
+
+	// Active Open
+	conn, err := socket_api.VConnect(link.IPAddr, ipAddr, uint16(port))
+	if err != nil {
+		r.HostInfo.Logger.Error(err.Error())
+		return ""
+	}
+
+	b.WriteString(fmt.Sprintf("Created new socket with SID=%d", conn.TCB.SID))
 	return b.String()
 }
 

@@ -1,25 +1,8 @@
 package socket
 
-import (
-    "net/netip"
-)
-
-type TCB struct {
-	SID   int // Socket Id
-	State SocketState // Socket State
-
-    Laddr netip.Addr // my ip addr
-    Lport uint16 // my ip port
-
-    Raddr netip.Addr // other ip addr
-    Rport uint16 // other ip port
-}
-
-type SocketState int
-
 const (
 	// Defines different state the TCP Socket can be in
-	LISTEN SocketState = iota
+	LISTEN = iota
 	SYN_SENT
 	SYN_RECEIVED
 	ESTABLISHED
@@ -34,20 +17,8 @@ const (
 
 // ============= Helper ==============
 
-// Create TCB for Listen Socket
-func CreateTCBForListenSocket(sid int, port uint16) *TCB {
-    return &TCB{
-        SID: sid,
-        State: LISTEN,
-        Laddr: netip.MustParseAddr("0.0.0.0"),
-        Lport: port,
-        Raddr: netip.MustParseAddr("0.0.0.0"),
-        Rport: 0,
-    }
-}
-
 // Given Socket State in int, return the string representation of it
-func ToSocketStateStr(state SocketState) string {
+func ToSocketStateStr(state int) string {
 	switch state {
 	case LISTEN:
 		{

@@ -8,8 +8,8 @@ import (
 )
 
 const (
-	TcpHeaderLen         = header.TCPMinimumSize
-	TcpPseudoHeaderLen   = 12
+	TcpHeaderLen       = header.TCPMinimumSize
+	TcpPseudoHeaderLen = 12
 )
 
 // Build a TCPFields struct from the TCP byte array
@@ -67,4 +67,29 @@ func ComputeTCPChecksum(tcpHdr *header.TCPFields,
 	// which seems to be the convention of the checksum algorithm
 	// in the netstack package's implementation
 	return fullChecksum ^ 0xffff
+}
+
+// Create a TCP Header
+func CreateTCPHeader(srcP uint16, dstP uint16, seq uint32,
+	ack uint32, dataOff uint8, flags uint8,
+	windowSize uint16) *header.TCPFields {
+	return &header.TCPFields{
+		SrcPort:       srcP,
+		DstPort:       dstP,
+		SeqNum:        seq,
+		AckNum:        ack,
+		DataOffset:    dataOff,
+		Flags:         flags,
+		WindowSize:    windowSize,
+		Checksum:      0,
+		UrgentPointer: 0,
+	}
+}
+
+// Serialize TCPHeader
+func MarshalTCPHeader(hdr *header.TCPFields) header.TCP {
+	// Serialize the TCP header
+	tcpHeaderBytes := make(header.TCP, TcpHeaderLen)
+	tcpHeaderBytes.Encode(hdr)
+	return tcpHeaderBytes
 }

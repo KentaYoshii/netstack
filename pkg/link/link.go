@@ -52,6 +52,11 @@ func (li *Link) InitializeLink() error {
 	return nil
 }
 
+// Statically add ARP entries
+func (li *Link) AddARPEntry(ip netip.Addr, mac netip.AddrPort) {
+	li.ARPTable[ip] = mac
+}
+
 // Add the neighbor to our broadcast list to be used in arp
 func (li *Link) AddNeighbor(nMAC netip.AddrPort) {
 	li.BroadCastAddrs = append(li.BroadCastAddrs, nMAC)
@@ -218,13 +223,18 @@ func (li *Link) SendLocal(packet *packet.Packet, dst netip.Addr, f bool) error {
 func (li *Link) ListenAtInterface(packetChan chan *packet.Packet, errorChan chan string) {
 	for {
 		buf := make([]byte, util.MTU)
-		_, _, err := li.ListenConn.ReadFromUDP(buf)
+		b, _, err := li.ListenConn.ReadFromUDP(buf)
 		if err != nil {
 			errorChan <- err.Error()
 			continue
 		}
 		if !li.IsUp {
 			// Don't recv
+			continue
+		}
+		if len(buf) > util.MTU {
+			// Exceed MAX
+			errorChan <- "Packet Bytes Exceed MTU"
 			continue
 		}
 		// Before we proceed, we check if the received bytes are arp message or not
@@ -248,7 +258,7 @@ func (li *Link) ListenAtInterface(packetChan chan *packet.Packet, errorChan chan
 		// Checksum ok so send the packet to the channel
 		packetChan <- &packet.Packet{
 			IPHeader: header,
-			Payload:  buf[header.Len:],
+			Payload:  buf[header.Len:b],
 		}
 	}
 }

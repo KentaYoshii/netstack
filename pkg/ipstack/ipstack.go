@@ -15,7 +15,7 @@ import (
 
 type ProtocolHandler func(*packet.Packet, *slog.Logger)
 
-type IpStack struct {
+type IPStack struct {
 
 	// Logger
 	Logger *slog.Logger
@@ -44,6 +44,8 @@ type IpStack struct {
 	RouteChan chan proto.NextHop
 	// Channels through which triggered updates are communicated to link layer
 	TriggerChans []chan proto.NextHop
+	// Channel through which Sockets communicate with IP stack
+	SendChan chan *proto.TCPPacket
 	// Channel for getting non-serious error messages
 	errorChan chan string
 	// Debugging
@@ -54,8 +56,8 @@ type IpStack struct {
 }
 
 // Create new IP stack
-func CreateIPStack() *IpStack {
-	return &IpStack{
+func CreateIPStack() *IPStack {
+	return &IPStack{
 		Logger: slog.New(util.NewPrettyHandler(os.Stdout, util.PrettyHandlerOptions{
 			SlogOpts: slog.HandlerOptions{
 				Level: slog.LevelInfo,
@@ -69,6 +71,7 @@ func CreateIPStack() *IpStack {
 		IpPacketChan:       make(chan *packet.Packet, 100),
 		ICMPChan:           make(chan *packet.Packet, 100),
 		RouteChan:          make(chan proto.NextHop, 100),
+		SendChan:           make(chan *proto.TCPPacket, 100),
 		errorChan:          make(chan string, 100),
 		InfoChan:           make(chan string, 100),
 	}
@@ -81,7 +84,7 @@ func CreateIPStack() *IpStack {
 // - init rip protocol (for routers)
 // - register ip protocol handlers
 // - start routines for processing packets and updating forwarding tables
-func (ip *IpStack) Initialize(config *util.IPConfig) {
+func (ip *IPStack) Initialize(config *util.IPConfig) {
 	// ============== Interface ==============
 	for _, i := range config.Interfaces {
 		ip.NameToPrefix[i.Name] = i.AssignedPrefix
@@ -98,10 +101,12 @@ func (ip *IpStack) Initialize(config *util.IPConfig) {
 			ARPChan:        make(chan link.ARPEntry, 100),
 		}
 	}
+
 	// Populate BroadcastAddrs for ARP protocol
 	for _, n := range config.Neighbors {
 		for prefix, li := range ip.Subnets {
 			if prefix.Contains(n.DestAddr) {
+				li.AddARPEntry(n.DestAddr, n.UDPAddr)
 				li.AddNeighbor(n.UDPAddr)
 				break
 			}
@@ -149,7 +154,7 @@ func (ip *IpStack) Initialize(config *util.IPConfig) {
 	} else {
 		// if host, initialize socket table
 		ip.RipEnabled = false
-		proto.InitializeTCPStack()
+		proto.InitializeTCPStack(ip.SendChan)
 	}
 
 	// ================== RIP ==================
@@ -178,21 +183,52 @@ func (ip *IpStack) Initialize(config *util.IPConfig) {
 	}
 	// ICMP PROTOCOL
 	ip.ProtocolHandlerMap[util.ICMP_PROTO] = proto.HandleICMPProtocol
+	// TCP PROTOCOL
+	ip.ProtocolHandlerMap[util.TCP_PROTO] = proto.HandleTCPProtocol
 
 	// =========== Routines =============
 	// Start processing incoming packets
 	go ip.ProcessPackets()
 	// Start monitoring route updates
 	go ip.CheckForRouteUpdates()
+	// Start processing outgoing packets
+	go ip.ProcessSendPackets()
+}
+
+// Loop through the SendChan to get packets to send out
+func (ip *IPStack) ProcessSendPackets() {
+	for tcpPacket := range ip.SendChan {
+		dstIP := tcpPacket.RAddr
+		srcIP := tcpPacket.LAddr
+		payload := tcpPacket.Payload
+		// Compute TCP checksum
+		checksum := util.ComputeTCPChecksum(tcpPacket.TCPHeader, srcIP, dstIP, payload)
+		tcpPacket.TCPHeader.Checksum = checksum
+		// Serialize Header
+		hdrBytes := util.MarshalTCPHeader(tcpPacket.TCPHeader)
+		// Combine the TCP header + payload into one byte array, which
+		// becomes the payload of the IP packet
+		ipPacketPayload := make([]byte, 0, len(hdrBytes)+len(payload))
+		ipPacketPayload = append(ipPacketPayload, hdrBytes...)
+		ipPacketPayload = append(ipPacketPayload, []byte(payload)...)
+		// Create new IP packet
+		newPacket := packet.CreateNewPacket(ipPacketPayload, srcIP, dstIP, util.TCP_PROTO, util.DEFAULT_TTL)
+		// Send out the IP packet
+		err := ip.SendPacket(newPacket, false)
+		if err != nil {
+			ip.errorChan <- err.Error()
+			continue
+		}
+	}
 }
 
 // Register a handler
-func (ip *IpStack) RegisterHandler(proto uint8, handler ProtocolHandler) {
+func (ip *IPStack) RegisterHandler(proto uint8, handler ProtocolHandler) {
 	ip.ProtocolHandlerMap[proto] = handler
 }
 
 // For each interface we have, initialize and start listening
-func (ip *IpStack) InitializeInterfaces() {
+func (ip *IPStack) InitializeInterfaces() {
 	for _, li := range ip.Subnets {
 		err := li.InitializeLink()
 		if err != nil {
@@ -203,7 +239,7 @@ func (ip *IpStack) InitializeInterfaces() {
 }
 
 // Given an Echo Request ICMP packet, responsd to it by creating and sending ICMP Echo Reply
-func (ip *IpStack) SendEchoReply(pac *packet.Packet, icmpPacket *proto.ICMPPacket) {
+func (ip *IPStack) SendEchoReply(pac *packet.Packet, icmpPacket *proto.ICMPPacket) {
 	// Construct Echo Reply Message
 	rep, err := proto.CreateEchoReplyMessageFrom(icmpPacket)
 	if err != nil {
@@ -228,7 +264,7 @@ func (ip *IpStack) SendEchoReply(pac *packet.Packet, icmpPacket *proto.ICMPPacke
 }
 
 // Given an Echo Request ICMP packet, responsd to it by creating and sending ICMP Echo Reply
-func (ip *IpStack) SendEchoRequest(ttl int, to netip.Addr) (int, int) {
+func (ip *IPStack) SendEchoRequest(ttl int, to netip.Addr) (int, int) {
 	link, valid := ip.GetOutgoingLink(to)
 	if !valid {
 		return 0, 0
@@ -256,7 +292,7 @@ func (ip *IpStack) SendEchoRequest(ttl int, to netip.Addr) (int, int) {
 
 // Function that sends an ICMP Packet with type "t" and code "c"
 // in response to invalid packet "packet"
-func (ip *IpStack) SendICMP(packet *packet.Packet, t uint8, c uint8) {
+func (ip *IPStack) SendICMP(packet *packet.Packet, t uint8, c uint8) {
 	// Get outgoing link
 	finalDst := packet.IPHeader.Src
 	link, valid := ip.GetOutgoingLink(finalDst)
@@ -281,7 +317,7 @@ func (ip *IpStack) SendICMP(packet *packet.Packet, t uint8, c uint8) {
 // - Get the NextHop by consulting the routing table
 // - Get the outgoing interface
 // - Send the packet out from that interface
-func (ip *IpStack) SendPacket(packet *packet.Packet, f bool) error {
+func (ip *IPStack) SendPacket(packet *packet.Packet, f bool) error {
 	// Get the next hop
 	nextHop, found := ip.GetNextHop(packet.IPHeader.Dst)
 	if !found {
@@ -300,7 +336,7 @@ func (ip *IpStack) SendPacket(packet *packet.Packet, f bool) error {
 }
 
 // Loop through the channels and listen for incoming packets
-func (ip *IpStack) ProcessPackets() {
+func (ip *IPStack) ProcessPackets() {
 	for {
 		select {
 		case packet := <-ip.IpPacketChan:
@@ -357,7 +393,7 @@ func (ip *IpStack) ProcessPackets() {
 //
 // Once we have dealt with the route, trigger our neighbors about the change
 // by sending to all the "triChan"s
-func (ip *IpStack) CheckForRouteUpdates() {
+func (ip *IPStack) CheckForRouteUpdates() {
 	for r := range ip.RouteChan {
 		ip.ftMtx.Lock()
 		if r.Expired {
@@ -388,7 +424,7 @@ func (ip *IpStack) CheckForRouteUpdates() {
 // - wait until we receive ICMP TIME_EXCEEDED or ICMP ECHO_REPLY
 //   - TIME_EXCEEDED -> mid way
 //   - ECHO_REPLY -> successfully reach the destination
-func (ip *IpStack) TraceRoute(ttl int, to netip.Addr, res chan proto.TraceRouteInfo) {
+func (ip *IPStack) TraceRoute(ttl int, to netip.Addr, res chan proto.TraceRouteInfo) {
 	// Send Echo Request
 	id, seq := ip.SendEchoRequest(ttl, to)
 	// Measure RTT
@@ -442,7 +478,7 @@ func (ip *IpStack) TraceRoute(ttl int, to netip.Addr, res chan proto.TraceRouteI
 // Pings the given ip
 // - send ICMP Echo Request to "to"
 // - wait until we receive ICMP ECHO_REPLY
-func (ip *IpStack) Ping(to netip.Addr, res chan proto.PingInfo) {
+func (ip *IPStack) Ping(to netip.Addr, res chan proto.PingInfo) {
 	// Send Echo Request
 	id, seq := ip.SendEchoRequest(util.DEFAULT_TTL, to)
 	// Measure RTT
@@ -492,7 +528,7 @@ func (ip *IpStack) Ping(to netip.Addr, res chan proto.PingInfo) {
 
 // Given destination IP address "dst", see to which interface
 // our next hop is connected to. Return that interface
-func (ip *IpStack) GetOutgoingLink(dst netip.Addr) (*link.Link, bool) {
+func (ip *IPStack) GetOutgoingLink(dst netip.Addr) (*link.Link, bool) {
 	nextHop, found := ip.GetNextHop(dst)
 	if !found {
 		ip.errorChan <- "NextHop for " + dst.String() + " not found"
@@ -512,7 +548,7 @@ func (ip *IpStack) GetOutgoingLink(dst netip.Addr) (*link.Link, bool) {
 
 // Checks if this packet is destined to one of my interfaces
 // if so, dst should match to one of our links' assigned IPAddr
-func (ip *IpStack) IsThisMyPacket(dst netip.Addr) bool {
+func (ip *IPStack) IsThisMyPacket(dst netip.Addr) bool {
 	for _, i := range ip.Subnets {
 		if dst.Compare(i.IPAddr) == 0 {
 			return true
@@ -523,7 +559,7 @@ func (ip *IpStack) IsThisMyPacket(dst netip.Addr) bool {
 
 // Given a destination IP Address, consult the forwarding table to get next hop
 // Performs a Longest Prefix Matching
-func (ip *IpStack) GetNextHop(dst netip.Addr) (proto.NextHop, bool) {
+func (ip *IPStack) GetNextHop(dst netip.Addr) (proto.NextHop, bool) {
 	// Check Forwarding Table
 	longest := -1
 	var niHop proto.NextHop
