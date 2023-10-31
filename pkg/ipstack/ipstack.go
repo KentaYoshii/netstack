@@ -376,6 +376,7 @@ func (ip *IPStack) ProcessPackets() {
 			if ip.LossRate != 0.0 {
 				// Drop the packet
 				if util.GenRandNum() < ip.LossRate {
+					ip.InfoChan <- "Dropping!"
 					continue
 				}
 			}

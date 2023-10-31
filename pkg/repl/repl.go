@@ -275,10 +275,9 @@ func (r *Repl) handleSocketClose(args []string) string {
 			return ""
 		}
 		// Remove from SID to Conn map
-		delete(socket_api.SIDToNormalSock, sid)
+		// delete(socket_api.SIDToNormalSock, sid)
 	}
 
-	b.WriteString(fmt.Sprintf("Successfully removed SID=%d", sid))
 	return b.String()
 }
 

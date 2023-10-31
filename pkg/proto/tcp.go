@@ -13,6 +13,8 @@ import (
 
 const (
 	MAX_WND_SIZE = 65535
+    DEFAULT_DATAOFFSET = 20
+
 )
 
 type TCPPacket struct {
@@ -35,6 +37,8 @@ type TCB struct {
 	// Communication between IP Stack and TCP Stack
 	ReceiveChan chan *TCPPacket
 	SendChan    chan *TCPPacket
+	// Signal Our FIN is ACK'ed
+	FinOK chan bool
 
 	// Pointers to Buffers
 	SendBuffer *socket.CircularBuffer
@@ -104,6 +108,18 @@ func InitializeTCPStack(sendChan chan *TCPPacket) {
 }
 
 // =================== Helper ===================
+
+// Given TCB state, create an ACK packet with the current variables and passed-in flags
+func (tcb *TCB) SendACKPacket(flag uint8) {
+	hdr := util.CreateTCPHeader(tcb.Lport, tcb.Rport, tcb.SND_NXT, tcb.RCV_NXT, DEFAULT_DATAOFFSET, flag, uint16(tcb.RCV_WND))
+	tcpPacket := &TCPPacket{
+		LAddr:     tcb.Laddr,
+		RAddr:     tcb.Raddr,
+		TCPHeader: hdr,
+		Payload:   []byte{},
+	}
+	tcb.SendChan <- tcpPacket
+}
 
 // Given TCB state, check if incoming segment is valid or not
 func (tcb *TCB) IsSegmentValid(tcpPacket *TCPPacket) bool {
@@ -177,6 +193,7 @@ func CreateTCBForNormalSocket(sid int, laddr netip.Addr, lport uint16,
 		Rport:       rport,
 		ReceiveChan: make(chan *TCPPacket, 100),
 		SendChan:    TCPStack.SendChan,
+		FinOK:       make(chan bool, 100),
 		RCV_WND:     MAX_WND_SIZE,
 	}
 }
@@ -189,11 +206,11 @@ func AddSocketToTable(key SocketTableKey, value *TCB) {
 
 // Remove Socket from Table
 func RemoveSocketFromTable(key SocketTableKey) {
-    tcb := TCPStack.SocketTable[key]
-    // Remove from SID to Key map
-    delete(TCPStack.SIDToTableKey, tcb.SID)
-    // Remove from actual Socket Table
-    delete(TCPStack.SocketTable, key)
+	tcb := TCPStack.SocketTable[key]
+	// Remove from SID to Key map
+	delete(TCPStack.SIDToTableKey, tcb.SID)
+	// Remove from actual Socket Table
+	delete(TCPStack.SocketTable, key)
 }
 
 // Given a port, bind to that port
@@ -242,10 +259,10 @@ func HandleTCPProtocol(packet *packet.Packet, l *slog.Logger) {
 	fromHdr := tcpHdr.Checksum
 	tcpHdr.Checksum = 0
 	computedChecksum := util.ComputeTCPChecksum(&tcpHdr, packet.IPHeader.Src, packet.IPHeader.Dst, payload)
-    if fromHdr != computedChecksum {
-        l.Error("TCP Checusum is wrong")
-        return
-    }
+	if fromHdr != computedChecksum {
+		l.Error("TCP Checusum is wrong")
+		return
+	}
 	// Construct TCP Packet
 	tcpPacket := &TCPPacket{
 		LAddr:     packet.IPHeader.Dst,
@@ -269,8 +286,8 @@ func HandleTCPProtocol(packet *packet.Packet, l *slog.Logger) {
 	if found {
 		// Should be SYN packet
 		tcb.ReceiveChan <- tcpPacket
-        return
+		return
 	}
-	
-    l.Info("Received TCP Packet destined to unknown application")
+
+	l.Info("Received TCP Packet destined to unknown application")
 }

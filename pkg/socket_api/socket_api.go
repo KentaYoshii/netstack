@@ -74,7 +74,7 @@ func (li *VTCPListener) VAccept() {
 		// 3. Update the connection state variables of the new TCB
 		// 4. Invoke the subroutine to proceed with the handshake
 		// 5. Once the 3-way Handshake is done dispatch the socket
-        //    - If fails, remove the alloc'ed TCB
+		//    - If fails, remove the alloc'ed TCB
 
 		// 1
 		sid := proto.AllocSID()
@@ -91,8 +91,8 @@ func (li *VTCPListener) VAccept() {
 		newTCB.SND_NXT = newTCB.ISS + 1
 		newTCB.RCV_NXT = tcpPacket.TCPHeader.SeqNum + 1
 		// 4
-		for i := 0; i < MAX_RETRANS; i++ {
-			suc := _passiveHandshake(newTCB)
+		for i := 1; i < MAX_RETRANS+1; i++ {
+			suc := _passiveHandshake(newTCB, i)
 			if suc {
 				// Connection is established!
 				li.InfoChan <- fmt.Sprintf("New connection on SID=%d => Created new socket with SID=%d", li.TCB.SID, newTCB.SID)
@@ -100,13 +100,15 @@ func (li *VTCPListener) VAccept() {
 				SIDToNormalSock[newTCB.SID] = &VTCPConn{
 					newTCB,
 				}
-				// 5 
+				// 5
 				go _doSocket(newTCB)
 				break
 			}
+			if i == MAX_RETRANS {
+				// If failed, remove the TCB
+				proto.RemoveSocketFromTable(key)
+			}
 		}
-        // If failed, remove the TCB 
-        proto.RemoveSocketFromTable(key)
 	}
 }
 
@@ -158,8 +160,12 @@ retry:
 	tcb.SND_UNA = iss
 	tcb.SND_NXT = iss + 1
 	// 4
-	for i := 0; i < MAX_RETRANS; i++ {
-		suc := _activeHandShake(tcb)
+	for i := 1; i < MAX_RETRANS+1; i++ {
+		suc, err := _activeHandShake(tcb, i)
+		if err != nil {
+			// CLOSED
+			return &VTCPConn{}, nil
+		}
 		if suc {
 			// SYN was ACK'ed
 			// Dispatch this socket
@@ -171,8 +177,8 @@ retry:
 		}
 	}
 
-    // Remove TCB
-    proto.RemoveSocketFromTable(key)
+	// Remove TCB
+	proto.RemoveSocketFromTable(key)
 	return &VTCPConn{}, errors.New("VConnect(): Destionation port does not exist")
 }
 
@@ -199,5 +205,43 @@ func (conn *VTCPConn) VWrite(data []byte) (int, error) {
 // VClose only initiates the close process, hence it is non-blocking.
 // VClose does not delete sockets
 func (conn *VTCPConn) VClose() error {
-	return nil
+
+	// SYN-SENT STATE
+	// Delete the TCB and return "error: closing" responses to any queued SENDs, or RECEIVEs.
+	// Currently, no way to test this as "c" command hangs
+	if conn.TCB.State == socket.SYN_SENT {
+		// Close the Receive channel to signal CLOSE
+		close(conn.TCB.ReceiveChan)
+		// Delete the TCB
+		key := proto.CreateSocketTableKey(false, conn.TCB.Laddr, conn.TCB.Lport, conn.TCB.Raddr, conn.TCB.Rport)
+		proto.RemoveSocketFromTable(key)
+        return nil
+	}
+
+	// SYN-RECEIVED STATE
+
+	// If no SENDs have been issued and there is no pending data to send, then form a FIN segment and send it, and enter FIN-WAIT-1 state; otherwise, queue for processing after entering ESTABLISHED state.
+	if conn.TCB.State == socket.SYN_RECEIVED {
+		// TODO: check
+		go _doActiveClose(conn.TCB)
+		return nil
+	}
+
+	// ESTABLISHED STATE
+
+	// Queue this until all preceding SENDs have been segmentized, then form a FIN segment and send it. In any case, enter FIN-WAIT-1 state.
+	if conn.TCB.State == socket.ESTABLISHED {
+		// TODO: check
+		go _doActiveClose(conn.TCB)
+		return nil
+	}
+
+	// CLOSE_WAIT
+	if conn.TCB.State == socket.CLOSE_WAIT {
+		go _doActiveClose(conn.TCB)
+		return nil
+	}
+
+	// FIN_WAIT_1, FIN_WAIT_2, CLOSING, LAST_ACK, TIME_WAIT
+	return errors.New("error: connection closing")
 }
