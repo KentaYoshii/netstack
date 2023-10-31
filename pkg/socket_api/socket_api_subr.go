@@ -73,6 +73,8 @@ func _passiveHandshake(tcb *proto.TCB, i int) bool {
 					continue
 				}
 
+                tcb.SND_UNA = SEG_ACK
+
 				// Update state
 				tcb.State = socket.ESTABLISHED
 
