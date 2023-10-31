@@ -18,7 +18,6 @@ type VTCPConn struct {
 	TCB *proto.TCB
 }
 
-
 // ================= VTCPListener ====================
 
 // PASSIVE_OPEN
@@ -57,7 +56,7 @@ func (li *VTCPListener) VAccept() {
 
 		if !more {
 			// Channel closed
-            li.TCB.ReapChan <- li.TCB.SID
+			li.TCB.ReapChan <- li.TCB.SID
 			return
 		}
 		if (tcpPacket.TCPHeader.Flags & util.SYN) == 0 {
@@ -165,14 +164,50 @@ retry:
 // Return number of bytes read into the buffer.
 // The returned error is nil on success, io.EOF if other side of connection has finished
 // or another error describing other failure cases.
-func (conn *VTCPConn) VRead(buf []byte) (int, error) {
+func VRead(tcb *proto.TCB, buf []byte) (int, error) {
+
+	// Socket State Check
+
+	if tcb.State == socket.LISTEN {
+		return 0, errors.New("error: remote socket unspecified")
+	}
+
+	// TODO: Check Receive Buffer
+	// If Buffer is empty and
+	if tcb.State == socket.CLOSE_WAIT {
+		// Other end done sending
+		return 0, errors.New("error: connection closing")
+	}
+
+	if tcb.State != socket.FIN_WAIT_1 &&
+		tcb.State != socket.FIN_WAIT_2 &&
+		tcb.State != socket.ESTABLISHED {
+		return 0, errors.New("error: connection closing")
+	}
+
+    // TODO: Receive
+
 	return -1, nil
 }
 
 // Writes data to the TCP socket. Data to write is in "data"
 // BLOCK until all data are in the send buffer of the socket
 // Returns the number of bytes written to the connection.
-func (conn *VTCPConn) VWrite(data []byte) (int, error) {
+func VWrite(tcb *proto.TCB, data []byte) (int, error) {
+
+	// Socket State Check
+
+	if tcb.State == socket.LISTEN {
+		return 0, errors.New("error: remote socket unspecified")
+	}
+
+	if tcb.State != socket.CLOSE_WAIT &&
+		tcb.State != socket.ESTABLISHED {
+		return 0, errors.New("error: connection closing")
+	}
+
+	// TODO: Else segmentize and send
+
 	return -1, nil
 }
 
@@ -183,11 +218,11 @@ func (conn *VTCPConn) VWrite(data []byte) (int, error) {
 // VClose does not delete sockets
 func VClose(tcb *proto.TCB) error {
 
-    // LISTEN STATE
-    if tcb.State == socket.LISTEN {
-        close(tcb.ReceiveChan)
-        return nil
-    }
+	// LISTEN STATE
+	if tcb.State == socket.LISTEN {
+		close(tcb.ReceiveChan)
+		return nil
+	}
 
 	// SYN-SENT STATE
 	// Delete the TCB and return "error: closing" responses to any queued SENDs, or RECEIVEs.

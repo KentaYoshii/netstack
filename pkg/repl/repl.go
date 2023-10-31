@@ -214,6 +214,29 @@ func (r *Repl) handleSocketSend(args []string) string {
 		return ""
 	}
 
+	sid, err := strconv.Atoi(args[1])
+	if err != nil {
+		r.HostInfo.Logger.Error(err.Error())
+		return ""
+	}
+
+	// Get tcb
+	tcb, found := proto.SIDToTCB(sid)
+
+	if !found {
+		// No socket with SID found, error out
+		r.HostInfo.Logger.Error(fmt.Sprintf("Socket with SID=%d does not exist", sid))
+		return ""
+	}
+
+	bytes_written, err := socket_api.VWrite(tcb, []byte(strings.Join(args[2:], " ")))
+	if err != nil {
+		r.HostInfo.Logger.Error(err.Error())
+		return ""
+	}
+
+	r.HostInfo.Logger.Info(fmt.Sprintf("%d bytes written to SID=%d", bytes_written, tcb.SID))
+
 	return b.String()
 }
 
@@ -227,6 +250,38 @@ func (r *Repl) handleSocketReceive(args []string) string {
 		return ""
 	}
 
+	sid, err := strconv.Atoi(args[1])
+	if err != nil {
+		r.HostInfo.Logger.Error(err.Error())
+		return ""
+	}
+
+	numB, err := strconv.Atoi(args[2])
+	if err != nil {
+		r.HostInfo.Logger.Error(err.Error())
+		return ""
+	}
+	if numB < 0 {
+		r.HostInfo.Logger.Error("cannot read less than 0 bytes")
+		return ""
+	}
+
+	// Get tcb
+	tcb, found := proto.SIDToTCB(sid)
+
+	if !found {
+		// No socket with SID found, error out
+		r.HostInfo.Logger.Error(fmt.Sprintf("Socket with SID=%d does not exist", sid))
+		return ""
+	}
+
+	// read
+	buf := make([]byte, proto.MAX_WND_SIZE)
+	bytes_read, err := socket_api.VRead(tcb, buf)
+
+	r.HostInfo.Logger.Info(fmt.Sprintf("%d bytes read from SID=%d, content=%s", 
+	bytes_read, tcb.SID, string(buf[:bytes_read])))
+	
 	return b.String()
 }
 
@@ -248,7 +303,7 @@ func (r *Repl) handleSocketClose(args []string) string {
 
 	// Get tcb
 	tcb, found := proto.SIDToTCB(sid)
-	
+
 	if !found {
 		// No socket with SID found, error out
 		r.HostInfo.Logger.Error(fmt.Sprintf("Socket with SID=%d does not exist", sid))

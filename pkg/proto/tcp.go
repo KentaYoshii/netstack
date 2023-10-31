@@ -47,6 +47,9 @@ type TCB struct {
 	// Pointers to Buffers
 	SendBuffer *socket.CircularBuffer
 	RecvBuffer *socket.CircularBuffer
+	// Early Arrival Queue
+	EarlyArrivals []*TCPPacket
+	// Retransmission Queue
 
 	// Initial Sequence Numbers
 	ISS uint32
@@ -215,18 +218,19 @@ func CreateTCBForListenSocket(sid int, port uint16) *TCB {
 func CreateTCBForNormalSocket(sid int, laddr netip.Addr, lport uint16,
 	raddr netip.Addr, rport uint16) *TCB {
 	return &TCB{
-		SID:         sid,
-		State:       socket.LISTEN,
-		Laddr:       laddr,
-		Lport:       lport,
-		Raddr:       raddr,
-		Rport:       rport,
-		ReceiveChan: make(chan *TCPPacket, 100),
-		SendChan:    TCPStack.SendChan,
-		ReapChan:    TCPStack.ReapChan,
-		FinOK:       make(chan bool, 100),
-		TimeReset:   make(chan bool, 100),
-		RCV_WND:     MAX_WND_SIZE,
+		SID:           sid,
+		State:         socket.LISTEN,
+		Laddr:         laddr,
+		Lport:         lport,
+		Raddr:         raddr,
+		Rport:         rport,
+		ReceiveChan:   make(chan *TCPPacket, 100),
+		SendChan:      TCPStack.SendChan,
+		ReapChan:      TCPStack.ReapChan,
+		FinOK:         make(chan bool, 100),
+		TimeReset:     make(chan bool, 100),
+		EarlyArrivals: make([]*TCPPacket, 100),
+		RCV_WND:       MAX_WND_SIZE,
 	}
 }
 
