@@ -1,7 +1,6 @@
 package socket_api
 
 import (
-	"errors"
 	"netstack/pkg/proto"
 	"netstack/pkg/socket"
 	"netstack/pkg/util"
@@ -12,6 +11,7 @@ const (
 	// Retransmission
 	MAX_RETRANS = 3
 	RTO_LB      = 1
+	MSL         = 5
 )
 
 // Function that handles a hadnshake for PASSIVE OPEN
@@ -106,7 +106,7 @@ func _passiveHandshake(tcb *proto.TCB, i int) bool {
 //
 // - This function only errors when a user initiates the CLOSE
 //   - This is a CLOSE on SYN_SENT state
-func _activeHandShake(tcb *proto.TCB, i int) (bool, error) {
+func _activeHandShake(tcb *proto.TCB, i int) bool {
 	// Send SYN
 	// <SEQ=ISS><CTL=SYN>
 	hdr := util.CreateTCPHeader(tcb.Lport, tcb.Rport, tcb.ISS, 0, proto.DEFAULT_DATAOFFSET, util.SYN, uint16(tcb.RCV_WND))
@@ -124,13 +124,14 @@ func _activeHandShake(tcb *proto.TCB, i int) (bool, error) {
 		case <-time.C:
 			{
 				// Timeout, abort
-				return false, nil
+				return false
 			}
 		case reply, more := <-tcb.ReceiveChan:
 			{
 				if !more {
 					// CLOSE call
-					return false, errors.New("error: closing")
+					tcb.ReapChan <- tcb.SID
+					return false
 				}
 				// 3.10.7.3
 				SEG_SEQ := reply.TCPHeader.SeqNum
@@ -164,7 +165,7 @@ func _activeHandShake(tcb *proto.TCB, i int) (bool, error) {
 				// <SEQ=SND.NXT><ACK=RCV.NXT><CTL=ACK>
 				tcb.SendACKPacket(util.ACK)
 				// Handshake is complete
-				return true, nil
+				return true
 			}
 		}
 	}
@@ -177,12 +178,13 @@ func _doSocket(tcb *proto.TCB) {
 		select {
 		case tcpPacket, more := <-tcb.ReceiveChan:
 			{
-                if !more {
-                    // CLOSED
-                    // - RETRANS EXPIRE
-                    // TODO: CLEANUP
-                    return
-                }
+				if !more {
+					// CLOSED
+					// - RETRANS EXPIRE
+					// let the reaper reap
+					tcb.ReapChan <- tcb.SID
+					return
+				}
 				// First perform the Segment acceptability test
 				if !tcb.IsSegmentValid(tcpPacket) {
 					// If invalid send ACK in reply
@@ -243,18 +245,19 @@ func _doSocket(tcb *proto.TCB) {
 						// ACK for our FIN
 						tcb.State = socket.TIME_WAIT
 					} else {
-                        // O.W. ignore
-                        continue
-                    }
+						// O.W. ignore
+						continue
+					}
 				}
 
 				if tcb.State == socket.LAST_ACK {
 					if FIN_ACK_FLAG {
-                        // ACK for our FIN
-                        tcb.FinOK <- true
-						// TODO:
-						// - Delete the TCB
+						// ACK for our FIN
+						tcb.FinOK <- true
+						// LAST_ACK -> CLOSED
 						tcb.State = socket.CLOSED
+						// Delete TCB
+						tcb.ReapChan <- tcb.SID
 						return
 					}
 				}
@@ -263,7 +266,8 @@ func _doSocket(tcb *proto.TCB) {
 				if tcb.State == socket.TIME_WAIT {
 					// ACK it
 					tcb.SendACKPacket(util.ACK)
-					// TODO: restart the timer
+					// restart the timer
+                    tcb.TimeReset <- true
 				}
 
 				// TODO: Process Segment Data
@@ -315,20 +319,42 @@ func _doSocket(tcb *proto.TCB) {
 				case socket.FIN_WAIT_1:
 					if FIN_ACK_FLAG {
 						tcb.State = socket.TIME_WAIT
-						// TODO: start the timer
+                        // Start the timer
+						go _doTimeWait(tcb)
 					} else {
 						tcb.State = socket.CLOSING
 					}
 					break
 				case socket.FIN_WAIT_2:
 					tcb.State = socket.TIME_WAIT
-					// TODO: start the timer
+                    // Start the timer
+					go _doTimeWait(tcb)
 				case socket.TIME_WAIT:
-					// TODO: restart the timer
+                    // Restart the timer
+					tcb.TimeReset <- true
 				default:
 					// Other states stay the same
 					break
 				}
+			}
+		}
+	}
+}
+
+func _doTimeWait(tcb *proto.TCB) {
+reset:
+	timer := time.NewTimer(2 * MSL * time.Second)
+	for {
+		select {
+		case <-timer.C:
+			{
+				// Time is up! Close the chan
+				close(tcb.ReceiveChan)
+				return
+			}
+		case <-tcb.TimeReset:
+			{
+                goto reset
 			}
 		}
 	}

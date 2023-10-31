@@ -12,9 +12,8 @@ import (
 )
 
 const (
-	MAX_WND_SIZE = 65535
-    DEFAULT_DATAOFFSET = 20
-
+	MAX_WND_SIZE       = 65535
+	DEFAULT_DATAOFFSET = 20
 )
 
 type TCPPacket struct {
@@ -39,6 +38,11 @@ type TCB struct {
 	SendChan    chan *TCPPacket
 	// Signal Our FIN is ACK'ed
 	FinOK chan bool
+	// Timer Reset (TIME_WAIT)
+	TimeReset chan bool
+
+	// Signal the Reaper for removeal
+	ReapChan chan int
 
 	// Pointers to Buffers
 	SendBuffer *socket.CircularBuffer
@@ -89,25 +93,40 @@ type TCPStackT struct {
 	BoundPorts map[int]bool
 	// Channel through which we communicate with the ipstack
 	SendChan chan *TCPPacket
+	// Reap Chan
+	ReapChan chan int
 }
 
 // Global Socket Table
-var TCPStack TCPStackT
+var TCPStack *TCPStackT
 
 // Function that initializes our Socket Table for hosts
 func InitializeTCPStack(sendChan chan *TCPPacket) {
-	TCPStack = TCPStackT{
+	TCPStack = &TCPStackT{
 		ISNCTR:        0,
 		NextSID:       0,
 		SIDToTableKey: make(map[int]SocketTableKey),
 		SocketTable:   make(map[SocketTableKey]*TCB),
 		BoundPorts:    make(map[int]bool),
 		SendChan:      sendChan,
+		ReapChan:      make(chan int, 100),
 	}
 	go util.KeepIncrement(&TCPStack.ISNCTR)
+	go TCPStack.Reap()
 }
 
 // =================== Helper ===================
+
+// Reap the sockets that expired
+func (stack *TCPStackT) Reap() {
+	// SID to remove
+	for sid := range stack.ReapChan {
+		stack.StMtx.Lock()
+		key := stack.SIDToTableKey[sid]
+		RemoveSocketFromTable(key)
+		stack.StMtx.Unlock()
+	}
+}
 
 // Given TCB state, create an ACK packet with the current variables and passed-in flags
 func (tcb *TCB) SendACKPacket(flag uint8) {
@@ -166,6 +185,15 @@ func SocketTableLookup(key SocketTableKey) (*TCB, bool) {
 	return tcb, ok
 }
 
+// Given a SID, return the TCB
+func SIDToTCB(sid int) (*TCB, bool) {
+	key, ok := TCPStack.SIDToTableKey[sid]
+	if !ok {
+		return nil, false
+	}
+	return SocketTableLookup(key)
+}
+
 // Create TCB for Listen Socket
 func CreateTCBForListenSocket(sid int, port uint16) *TCB {
 	return &TCB{
@@ -176,7 +204,9 @@ func CreateTCBForListenSocket(sid int, port uint16) *TCB {
 		Raddr:       netip.MustParseAddr("0.0.0.0"),
 		Rport:       0,
 		ReceiveChan: make(chan *TCPPacket, 100),
+		ReapChan:    TCPStack.ReapChan,
 		SendChan:    TCPStack.SendChan,
+		TimeReset:   make(chan bool, 100),
 		RCV_WND:     MAX_WND_SIZE,
 	}
 }
@@ -193,7 +223,9 @@ func CreateTCBForNormalSocket(sid int, laddr netip.Addr, lport uint16,
 		Rport:       rport,
 		ReceiveChan: make(chan *TCPPacket, 100),
 		SendChan:    TCPStack.SendChan,
+		ReapChan:    TCPStack.ReapChan,
 		FinOK:       make(chan bool, 100),
+		TimeReset:   make(chan bool, 100),
 		RCV_WND:     MAX_WND_SIZE,
 	}
 }
@@ -211,11 +243,16 @@ func RemoveSocketFromTable(key SocketTableKey) {
 	delete(TCPStack.SIDToTableKey, tcb.SID)
 	// Remove from actual Socket Table
 	delete(TCPStack.SocketTable, key)
+	// If listen sock, un-bind
+	if tcb.State == socket.LISTEN {
+		unbind := tcb.Lport
+		TCPStack.BoundPorts[int(unbind)] = false
+	}
 }
 
 // Given a port, bind to that port
 func BindPort(toBind int) bool {
-	if _, ok := TCPStack.BoundPorts[toBind]; ok {
+	if val, ok := TCPStack.BoundPorts[toBind]; ok && val {
 		return false
 	}
 	TCPStack.BoundPorts[toBind] = true

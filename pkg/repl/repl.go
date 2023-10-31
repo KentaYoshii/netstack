@@ -148,9 +148,6 @@ func (r *Repl) handleSocketListenAndAccept(args []string) string {
 		return ""
 	}
 
-	// Add to Mapping
-	socket_api.SIDToListenSock[listenSock.TCB.SID] = listenSock
-
 	// For announcing new connections
 	listenSock.InfoChan = r.HostInfo.InfoChan
 
@@ -203,8 +200,6 @@ func (r *Repl) handleSocketConnect(args []string) string {
 		return ""
 	}
 
-	socket_api.SIDToNormalSock[conn.TCB.SID] = conn
-
 	b.WriteString(fmt.Sprintf("Created new socket with SID=%d", conn.TCB.SID))
 	return b.String()
 }
@@ -251,31 +246,18 @@ func (r *Repl) handleSocketClose(args []string) string {
 		return ""
 	}
 
-	// First check our listening sockets
-	sock, found := socket_api.SIDToListenSock[sid]
-	if found {
-		// If found, invoke its close function
-		if err = sock.VClose(); err != nil {
-			r.HostInfo.Logger.Error(err.Error())
-			return ""
-		}
-		// Remove from SID to Conn map
-		delete(socket_api.SIDToListenSock, sid)
-	} else {
-		// If not found, check normal sockets
-		nsock, found := socket_api.SIDToNormalSock[sid]
-		if !found {
-			// No socket with SID found, error out
-			r.HostInfo.Logger.Error(fmt.Sprintf("Socket with SID=%d does not exist", sid))
-			return ""
-		}
-		// If found invoke its close function
-		if err = nsock.VClose(); err != nil {
-			r.HostInfo.Logger.Error(err.Error())
-			return ""
-		}
-		// Remove from SID to Conn map
-		// delete(socket_api.SIDToNormalSock, sid)
+	// Get tcb
+	tcb, found := proto.SIDToTCB(sid)
+	
+	if !found {
+		// No socket with SID found, error out
+		r.HostInfo.Logger.Error(fmt.Sprintf("Socket with SID=%d does not exist", sid))
+		return ""
+	}
+
+	if err = socket_api.VClose(tcb); err != nil {
+		r.HostInfo.Logger.Error(err.Error())
+		return ""
 	}
 
 	return b.String()

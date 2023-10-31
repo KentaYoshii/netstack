@@ -18,10 +18,6 @@ type VTCPConn struct {
 	TCB *proto.TCB
 }
 
-// Maps of SIDs to Conns
-// Used in our REPL for easy access to sockets
-var SIDToListenSock map[int]*VTCPListener = make(map[int]*VTCPListener)
-var SIDToNormalSock map[int]*VTCPConn = make(map[int]*VTCPConn)
 
 // ================= VTCPListener ====================
 
@@ -61,6 +57,7 @@ func (li *VTCPListener) VAccept() {
 
 		if !more {
 			// Channel closed
+            li.TCB.ReapChan <- li.TCB.SID
 			return
 		}
 		if (tcpPacket.TCPHeader.Flags & util.SYN) == 0 {
@@ -96,32 +93,16 @@ func (li *VTCPListener) VAccept() {
 			if suc {
 				// Connection is established!
 				li.InfoChan <- fmt.Sprintf("New connection on SID=%d => Created new socket with SID=%d", li.TCB.SID, newTCB.SID)
-				// Add to mapping
-				SIDToNormalSock[newTCB.SID] = &VTCPConn{
-					newTCB,
-				}
 				// 5
 				go _doSocket(newTCB)
 				break
 			}
 			if i == MAX_RETRANS {
 				// If failed, remove the TCB
-				proto.RemoveSocketFromTable(key)
+				newTCB.ReapChan <- newTCB.SID
 			}
 		}
 	}
-}
-
-// Closes this listening socket, removing it from the socket table.
-// No new connection may be made on this socket.
-// Returns eror if closing fails
-func (li *VTCPListener) VClose() error {
-	// First close the receive chan so no new SYN packet is received
-	close(li.TCB.ReceiveChan)
-	// Remove
-	key := proto.CreateSocketTableKey(true, netip.Addr{}, li.TCB.Lport, netip.Addr{}, 0)
-	proto.RemoveSocketFromTable(key)
-	return nil
 }
 
 // ================= VTCPConn =========================
@@ -161,11 +142,7 @@ retry:
 	tcb.SND_NXT = iss + 1
 	// 4
 	for i := 1; i < MAX_RETRANS+1; i++ {
-		suc, err := _activeHandShake(tcb, i)
-		if err != nil {
-			// CLOSED
-			return &VTCPConn{}, nil
-		}
+		suc := _activeHandShake(tcb, i)
 		if suc {
 			// SYN was ACK'ed
 			// Dispatch this socket
@@ -178,7 +155,7 @@ retry:
 	}
 
 	// Remove TCB
-	proto.RemoveSocketFromTable(key)
+	tcb.ReapChan <- tcb.SID
 	return &VTCPConn{}, errors.New("VConnect(): Destionation port does not exist")
 }
 
@@ -204,41 +181,44 @@ func (conn *VTCPConn) VWrite(data []byte) (int, error) {
 // (NOTE)
 // VClose only initiates the close process, hence it is non-blocking.
 // VClose does not delete sockets
-func (conn *VTCPConn) VClose() error {
+func VClose(tcb *proto.TCB) error {
+
+    // LISTEN STATE
+    if tcb.State == socket.LISTEN {
+        close(tcb.ReceiveChan)
+        return nil
+    }
 
 	// SYN-SENT STATE
 	// Delete the TCB and return "error: closing" responses to any queued SENDs, or RECEIVEs.
 	// Currently, no way to test this as "c" command hangs
-	if conn.TCB.State == socket.SYN_SENT {
+	if tcb.State == socket.SYN_SENT {
 		// Close the Receive channel to signal CLOSE
-		close(conn.TCB.ReceiveChan)
-		// Delete the TCB
-		key := proto.CreateSocketTableKey(false, conn.TCB.Laddr, conn.TCB.Lport, conn.TCB.Raddr, conn.TCB.Rport)
-		proto.RemoveSocketFromTable(key)
-        return nil
+		close(tcb.ReceiveChan)
+		return nil
 	}
 
 	// SYN-RECEIVED STATE
 
 	// If no SENDs have been issued and there is no pending data to send, then form a FIN segment and send it, and enter FIN-WAIT-1 state; otherwise, queue for processing after entering ESTABLISHED state.
-	if conn.TCB.State == socket.SYN_RECEIVED {
+	if tcb.State == socket.SYN_RECEIVED {
 		// TODO: check
-		go _doActiveClose(conn.TCB)
+		go _doActiveClose(tcb)
 		return nil
 	}
 
 	// ESTABLISHED STATE
 
 	// Queue this until all preceding SENDs have been segmentized, then form a FIN segment and send it. In any case, enter FIN-WAIT-1 state.
-	if conn.TCB.State == socket.ESTABLISHED {
+	if tcb.State == socket.ESTABLISHED {
 		// TODO: check
-		go _doActiveClose(conn.TCB)
+		go _doActiveClose(tcb)
 		return nil
 	}
 
 	// CLOSE_WAIT
-	if conn.TCB.State == socket.CLOSE_WAIT {
-		go _doActiveClose(conn.TCB)
+	if tcb.State == socket.CLOSE_WAIT {
+		go _doActiveClose(tcb)
 		return nil
 	}
 
