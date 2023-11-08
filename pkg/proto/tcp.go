@@ -1,6 +1,7 @@
 package proto
 
 import (
+	"fmt"
 	"log/slog"
 	"net/netip"
 	"netstack/pkg/packet"
@@ -15,6 +16,13 @@ const (
 	MAX_WND_SIZE       = 65535
 	DEFAULT_DATAOFFSET = 20
 )
+
+type Segment struct {
+	Packet *TCPPacket
+	ACKed  chan bool
+	RTT    float32
+	Mu     sync.Mutex
+}
 
 type TCPPacket struct {
 	LAddr     netip.Addr
@@ -40,9 +48,14 @@ type TCB struct {
 	FinOK chan bool
 	// Timer Reset (TIME_WAIT)
 	TimeReset chan bool
-
 	// Signal the Reaper for removeal
 	ReapChan chan int
+	// Update to SND_WND
+	SendSignal chan bool
+	// ACK signal
+	ACKSignal chan bool
+	// Data signal
+	DataSignal chan bool
 
 	// Pointers to Buffers
 	SendBuffer *socket.CircularBuffer
@@ -50,6 +63,7 @@ type TCB struct {
 	// Early Arrival Queue
 	EarlyArrivals []*TCPPacket
 	// Retransmission Queue
+	RetransmissionQ []*Segment
 
 	// Initial Sequence Numbers
 	ISS uint32
@@ -63,6 +77,9 @@ type TCB struct {
 	SND_WL2 uint32
 	RCV_NXT uint32
 	RCV_WND uint32
+
+	// Last Byte Read
+	LBR uint32
 }
 
 type SocketTableKey struct {
@@ -71,14 +88,6 @@ type SocketTableKey struct {
 	Lport uint16
 	Raddr netip.Addr
 	Rport uint16
-}
-
-type SocketTableT struct {
-	// Socket Id to Key into TCB for ease of access from REPL
-	SIDToTableKey map[int]SocketTableKey
-	// The Cannonical table
-	Table map[SocketTableKey]*TCB
-	StMtx sync.Mutex
 }
 
 type TCPStackT struct {
@@ -120,6 +129,166 @@ func InitializeTCPStack(sendChan chan *TCPPacket) {
 
 // =================== Helper ===================
 
+// Remove ACK'ed segments from the RTQ
+// Update RTO dynamically for segments that cannot be removed
+// We DON't partially update tcp packet payload
+func (tcb *TCB) RQManager() {
+	for {
+		// First Wait until we get a signal that SND.UNA has been updated
+		<-tcb.ACKSignal
+		newRQ := make([]*Segment, 0)
+		// For each segment check
+		// - Complete ACK -> (SEG.SEQ + SEG.LEN - 1 < SND.UNA)
+		//   - SEQ=3, LEN=3 -> (3,4,5) ok when SND.UNA >= 6
+		// - Else there is data not ACK'ed yet
+		for _, seg := range tcb.RetransmissionQ {
+			seg.Mu.Lock()
+			seg_seq := seg.Packet.TCPHeader.SeqNum
+			seg_len := uint32(len(seg.Packet.Payload))
+			seg_lb := seg_seq + seg_len - 1
+			if seg_lb < tcb.SND_UNA {
+				// This segment data ALL ACK'ed
+				seg.ACKed <- true
+			} else {
+				// The segment data is NOT FULLY ACK'ed
+				// TODO: update the RTO here
+				// Update Packet for RT
+				seg.Packet.TCPHeader.WindowSize = uint16(tcb.GetAdvertisedWND())
+				seg.Packet.TCPHeader.AckNum = tcb.RCV_NXT
+				newRQ = append(newRQ, seg)
+			}
+			seg.Mu.Unlock()
+		}
+		tcb.RetransmissionQ = newRQ
+	}
+}
+
+// Insert so that Early Arrival Packets are in order of their sequence numbers
+// Example:
+// If you have EAQ of 1 4 5 6
+// - You get packet with seq 3
+// - Insert position is hence 1 (after 1)
+// - Append a temp slice 1 4 5 6 temp
+// - Copy (1 4 4 5 6) and update insert pos
+// - Result is 1 3 4 5 6
+func (tcb *TCB) InsertEAQ(packet *TCPPacket) {
+	if len(tcb.EarlyArrivals) == 0 {
+		tcb.EarlyArrivals = append(tcb.EarlyArrivals, packet)
+		return
+	}
+	insertPos := 0
+	found := false
+	insertSeq := packet.TCPHeader.SeqNum
+	for i, curr := range tcb.EarlyArrivals {
+		if insertSeq == curr.TCPHeader.SeqNum {
+			// We already have this in our early arrivals queue => nop
+			return
+		}
+		if curr.TCPHeader.SeqNum > insertSeq {
+			// We find our insert position
+			insertPos = i
+			found = true
+			break
+		}
+	}
+	var q []*TCPPacket
+	if !found {
+		// append at the end
+		q = append(tcb.EarlyArrivals, packet)
+	} else {
+		// insert
+		q := append(tcb.EarlyArrivals, &TCPPacket{})
+		copy(q[insertPos+1:], q[insertPos:])
+		q[insertPos] = packet
+	}
+	tcb.EarlyArrivals = q
+}
+
+// Given start sequence and end sequence number (incl.) of current segment data
+// Loop the EAQ and merge data
+func (tcb *TCB) MergeEAQ(end uint32, currData []byte) []byte {
+	// available space
+	available := tcb.GetAdvertisedWND() - uint32(len(currData))
+	for i, curr := range tcb.EarlyArrivals {
+		currSEQ := curr.TCPHeader.SeqNum
+		currEND := currSEQ + uint32(len(curr.Payload)) - 1
+		if currEND <= end {
+			// already received
+			continue
+		}
+		if currSEQ > end+1 {
+			// not contiguous -> cannot receive
+			// - remove all the preceding segments
+			tcb.EarlyArrivals = tcb.EarlyArrivals[i:]
+			return currData
+		}
+		// Either currSEQ - 1 == end or
+		// end lies in [currSEQ, currEND]
+		mergeLen := min(int(available), len(curr.Payload))
+		// Get the offset
+		off := ((end + 1) - currSEQ)
+		// Get the data
+		mergeData := curr.Payload[off : off+uint32(mergeLen)]
+		currData = append(currData, mergeData...)
+		available -= uint32(mergeLen)
+		if available == 0 {
+			if mergeLen != len(curr.Payload) {
+				// we have not completely merged this segment
+				tcb.EarlyArrivals = tcb.EarlyArrivals[i:]
+			} else {
+				// we completely merged this segment
+				if i == len(tcb.EarlyArrivals)-1 {
+					// if this is the last segment
+					// we know we are done with this queue
+					tcb.EarlyArrivals = make([]*TCPPacket, 0)
+				} else {
+					// if not, remove self and go on
+					tcb.EarlyArrivals = tcb.EarlyArrivals[i+1:]
+				}
+			}
+			return currData
+		}
+		end += uint32(mergeLen)
+	}
+
+	// If we get here we have merged everything and available > 0
+	tcb.EarlyArrivals = make([]*TCPPacket, 0)
+	return currData
+}
+
+// Get the useable window given a TCB state
+func (tcb *TCB) GetUseableWND() uint32 {
+	return tcb.SND_UNA + tcb.SND_WND - tcb.SND_NXT
+}
+
+// Get the advertised window given a TCB state
+// MAX_BUF - (NXT - 1 - LBR)
+// Example: MAX_BUF = 10
+//
+// + = byte consumed
+// * = byte not yet consumed
+//
+//	l       n
+//
+// [ + * * * + + + + + + ]
+// 10 - (4 - 1 - 0) = 7
+//
+//	l       n
+//
+// [ + + + + * * * + + + ]
+// 10 - (7 - 1 - 3) = 7
+// l                     n
+// [ * * * * * * * * * * ]
+// 10 - (10 - 1 - (-1)) = 0
+func (tcb *TCB) GetAdvertisedWND() uint32 {
+	return MAX_WND_SIZE - ((tcb.RCV_NXT - 1) - tcb.LBR)
+}
+
+// Gets the number of unread bytes in the recv buffer
+func (tcb *TCB) GetUnreadBytes() uint32 {
+	return (tcb.RCV_NXT - 1) - tcb.LBR
+}
+
 // Reap the sockets that expired
 func (stack *TCPStackT) Reap() {
 	// SID to remove
@@ -132,39 +301,67 @@ func (stack *TCPStackT) Reap() {
 }
 
 // Given TCB state, create an ACK packet with the current variables and passed-in flags
-func (tcb *TCB) SendACKPacket(flag uint8) {
-	hdr := util.CreateTCPHeader(tcb.Lport, tcb.Rport, tcb.SND_NXT, tcb.RCV_NXT, DEFAULT_DATAOFFSET, flag, uint16(tcb.RCV_WND))
+func (tcb *TCB) SendACKPacket(flag uint8, data []byte) *TCPPacket {
+	hdr := util.CreateTCPHeader(tcb.Lport, tcb.Rport, tcb.SND_NXT,
+		tcb.RCV_NXT, DEFAULT_DATAOFFSET, flag,
+		uint16(tcb.GetAdvertisedWND()))
 	tcpPacket := &TCPPacket{
 		LAddr:     tcb.Laddr,
 		RAddr:     tcb.Raddr,
 		TCPHeader: hdr,
-		Payload:   []byte{},
+		Payload:   data,
 	}
 	tcb.SendChan <- tcpPacket
+	return tcpPacket
+}
+
+// Helper to print out the different connection variables
+func (tcb *TCB) PrintTCBState() {
+	iss := tcb.ISS
+	irs := tcb.IRS
+	fmt.Println("----- TCB State -----")
+	fmt.Println("SND_UNA", tcb.SND_UNA-iss)
+	fmt.Println("SND_NXT", tcb.SND_NXT-iss)
+	fmt.Println("SND_WND", tcb.SND_WND)
+	fmt.Println("RCV_NXT", tcb.RCV_NXT-irs)
+	fmt.Println("RCV_WND", tcb.RCV_WND)
+	fmt.Println("LBR", tcb.LBR)
+	fmt.Println("---------------------")
+}
+
+func (tcb *TCB) PrintSegment(seg *TCPPacket) {
+	iss := tcb.ISS 
+	irs := tcb.IRS
+	fmt.Println("----- SEGMENT -----")
+	fmt.Println("SEG_SEQ", seg.TCPHeader.SeqNum - irs)
+	fmt.Println("SEG_ACK", seg.TCPHeader.AckNum - iss)
+	fmt.Println("SEG_LEN", len(seg.Payload))
+	fmt.Println("SEG_WND", seg.TCPHeader.WindowSize)
+	fmt.Println("-------------------")
 }
 
 // Given TCB state, check if incoming segment is valid or not
 func (tcb *TCB) IsSegmentValid(tcpPacket *TCPPacket) bool {
 	SEG_LEN := len(tcpPacket.Payload)
 	SEG_SEQ := tcpPacket.TCPHeader.SeqNum
-
+	RCV_WND := tcb.GetAdvertisedWND()
 	// Four CASES
 
 	// Case 1: SEG_LEN = 0 && RECV_WND = 0
 	// -> SEG_SEQ = RCV_NXT
-	if SEG_LEN == 0 && tcb.RCV_WND == 0 {
-		return SEG_SEQ == tcb.RCV_NXT
+	if SEG_LEN == 0 && RCV_WND == 0 {
+		return SEG_SEQ == RCV_WND
 	}
 
 	// Case 2: SEG_LEN = 0 && RECV_WND > 0
 	// -> RCV.NXT <= SEG.SEQ <= RCV.NXT+RCV.WND
-	if SEG_LEN == 0 && tcb.RCV_WND > 0 {
-		return (tcb.RCV_NXT <= SEG_SEQ) && (SEG_SEQ <= tcb.RCV_NXT+tcb.RCV_WND)
+	if SEG_LEN == 0 && RCV_WND > 0 {
+		return (tcb.RCV_NXT <= SEG_SEQ) && (SEG_SEQ <= tcb.RCV_NXT+RCV_WND)
 	}
 
 	// Case 3: SEG_LEN > 0 && RECV_WND = 0
 	// -> Not acceptable
-	if SEG_LEN > 0 && tcb.RCV_WND == 0 {
+	if SEG_LEN > 0 && RCV_WND == 0 {
 		return false
 	}
 
@@ -174,9 +371,9 @@ func (tcb *TCB) IsSegmentValid(tcpPacket *TCPPacket) bool {
 	// -> RCV.NXT <= SEG.SEQ+SEG_LEN-1 < RCV.NXT+RCV.WND
 
 	// Does first part of the segment fall within the window
-	cond1 := (tcb.RCV_NXT <= SEG_SEQ) && (SEG_SEQ <= tcb.RCV_NXT+tcb.RCV_WND)
+	cond1 := (tcb.RCV_NXT <= SEG_SEQ) && (SEG_SEQ <= tcb.RCV_NXT+RCV_WND)
 	// Does last part of the segment fall within the window
-	cond2 := (tcb.RCV_NXT <= SEG_SEQ+uint32(SEG_LEN)-1) && (SEG_SEQ+uint32(SEG_LEN)-1 <= tcb.RCV_NXT+tcb.RCV_WND)
+	cond2 := (tcb.RCV_NXT <= SEG_SEQ+uint32(SEG_LEN)-1) && (SEG_SEQ+uint32(SEG_LEN)-1 <= tcb.RCV_NXT+RCV_WND)
 
 	// If either is true, there is data
 	return cond1 || cond2
@@ -210,6 +407,7 @@ func CreateTCBForListenSocket(sid int, port uint16) *TCB {
 		ReapChan:    TCPStack.ReapChan,
 		SendChan:    TCPStack.SendChan,
 		TimeReset:   make(chan bool, 100),
+		SND_WND:     MAX_WND_SIZE,
 		RCV_WND:     MAX_WND_SIZE,
 	}
 }
@@ -218,19 +416,39 @@ func CreateTCBForListenSocket(sid int, port uint16) *TCB {
 func CreateTCBForNormalSocket(sid int, laddr netip.Addr, lport uint16,
 	raddr netip.Addr, rport uint16) *TCB {
 	return &TCB{
-		SID:           sid,
-		State:         socket.LISTEN,
-		Laddr:         laddr,
-		Lport:         lport,
-		Raddr:         raddr,
-		Rport:         rport,
-		ReceiveChan:   make(chan *TCPPacket, 100),
-		SendChan:      TCPStack.SendChan,
-		ReapChan:      TCPStack.ReapChan,
-		FinOK:         make(chan bool, 100),
-		TimeReset:     make(chan bool, 100),
-		EarlyArrivals: make([]*TCPPacket, 100),
-		RCV_WND:       MAX_WND_SIZE,
+		// Basic Connection Information
+		SID:   sid,
+		State: socket.LISTEN,
+		Laddr: laddr,
+		Lport: lport,
+		Raddr: raddr,
+		Rport: rport,
+		// IPStack <=> Socket(s)
+		ReceiveChan: make(chan *TCPPacket, 100),
+		SendChan:    TCPStack.SendChan,
+		// Sent when our FIN packet was ACK'ed
+		FinOK: make(chan bool, 100),
+		// Reset chan for restarting TIME-WAIT timer
+		TimeReset: make(chan bool, 100),
+		// Signal the reaper to reap sent SID
+		ReapChan: TCPStack.ReapChan,
+		// Update to SND_WND
+		SendSignal: make(chan bool, 100),
+		// ACK signal
+		ACKSignal:  make(chan bool, 100),
+		// Data signal
+		DataSignal: make(chan bool, 100),
+		// Buffers
+		SendBuffer: socket.InitCircularBuffer(),
+		RecvBuffer: socket.InitCircularBuffer(),
+		// Early Arrival Queue
+		EarlyArrivals: make([]*TCPPacket, 0),
+		// Retransmission Queue
+		RetransmissionQ: make([]*Segment, 0),
+		// Receive Window is max initially
+		RCV_WND: MAX_WND_SIZE,
+		// Last Byte Read
+		LBR: 0,
 	}
 }
 

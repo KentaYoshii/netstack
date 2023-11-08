@@ -86,6 +86,8 @@ func (li *VTCPListener) VAccept() {
 		newTCB.SND_UNA = newTCB.ISS
 		newTCB.SND_NXT = newTCB.ISS + 1
 		newTCB.RCV_NXT = tcpPacket.TCPHeader.SeqNum + 1
+		newTCB.SND_WND = uint32(tcpPacket.TCPHeader.WindowSize)
+		newTCB.LBR = tcpPacket.TCPHeader.SeqNum
 		// 4
 		for i := 1; i < MAX_RETRANS+1; i++ {
 			suc := _passiveHandshake(newTCB, i)
@@ -94,6 +96,7 @@ func (li *VTCPListener) VAccept() {
 				li.InfoChan <- fmt.Sprintf("New connection on SID=%d => Created new socket with SID=%d", li.TCB.SID, newTCB.SID)
 				// 5
 				go _doSocket(newTCB)
+				go newTCB.RQManager()
 				break
 			}
 			if i == MAX_RETRANS {
@@ -146,6 +149,7 @@ retry:
 			// SYN was ACK'ed
 			// Dispatch this socket
 			go _doSocket(tcb)
+			go tcb.RQManager()
 			// Return the conn
 			return &VTCPConn{
 				TCB: tcb,
@@ -172,9 +176,9 @@ func VRead(tcb *proto.TCB, buf []byte) (int, error) {
 		return 0, errors.New("error: remote socket unspecified")
 	}
 
-	// TODO: Check Receive Buffer
 	// If Buffer is empty and
-	if tcb.State == socket.CLOSE_WAIT {
+	if tcb.State == socket.CLOSE_WAIT &&
+		tcb.GetUnreadBytes() == 0 {
 		// Other end done sending
 		return 0, errors.New("error: connection closing")
 	}
@@ -185,9 +189,25 @@ func VRead(tcb *proto.TCB, buf []byte) (int, error) {
 		return 0, errors.New("error: connection closing")
 	}
 
-    // TODO: Receive
+	// BLOCK when there is data to read
 
-	return -1, nil
+	// First check the recv buffer
+	for {
+		if tcb.GetUnreadBytes() == 0 {
+			// Block until signaled
+			<-tcb.DataSignal
+		} else {
+			break
+		}
+	}
+	// Then read the data that was put
+	// If user wants to read 5 bytes but only 3 bytes
+	// were put, read that 3 bytes
+	toReadBytes := min(len(buf), int(tcb.GetUnreadBytes()))
+	tcb.RecvBuffer.Get(buf[:toReadBytes])
+	tcb.LBR += uint32(toReadBytes)
+
+	return toReadBytes, nil
 }
 
 // Writes data to the TCP socket. Data to write is in "data"
@@ -206,9 +226,18 @@ func VWrite(tcb *proto.TCB, data []byte) (int, error) {
 		return 0, errors.New("error: connection closing")
 	}
 
-	// TODO: Else segmentize and send
+	totalSize := len(data)
+	bytesWritten := 0
+	for totalSize > 0 {
+		// First get the current segment
+		currSEGLEN := min(totalSize, MAX_SEG_SIZE)
+		// Then send
+		_doSend(tcb, data[bytesWritten:bytesWritten+currSEGLEN])
+		totalSize -= currSEGLEN
+		bytesWritten += currSEGLEN
+	}
 
-	return -1, nil
+	return bytesWritten, nil
 }
 
 // Initiates the connection termination process for this socket

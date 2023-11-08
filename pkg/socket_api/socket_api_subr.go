@@ -1,6 +1,7 @@
 package socket_api
 
 import (
+	"fmt"
 	"netstack/pkg/proto"
 	"netstack/pkg/socket"
 	"netstack/pkg/util"
@@ -9,9 +10,10 @@ import (
 
 const (
 	// Retransmission
-	MAX_RETRANS = 3
-	RTO_LB      = 1
-	MSL         = 5
+	MAX_RETRANS  = 3
+	RTO_LB       = 1
+	MSL          = 5
+	MAX_SEG_SIZE = 1400 - (util.HeaderLen - util.TcpHeaderLen)
 )
 
 // Function that handles a hadnshake for PASSIVE OPEN
@@ -55,7 +57,7 @@ func _passiveHandshake(tcb *proto.TCB, i int) bool {
 				if !tcb.IsSegmentValid(reply) {
 					// If invalid send ACK in reply
 					// <SEQ=SND.NXT><ACK=RCV.NXT><CTL=ACK>
-					tcb.SendACKPacket(util.ACK)
+					tcb.SendACKPacket(util.ACK, []byte{})
 					continue
 				}
 
@@ -73,7 +75,7 @@ func _passiveHandshake(tcb *proto.TCB, i int) bool {
 					continue
 				}
 
-                tcb.SND_UNA = SEG_ACK
+				tcb.SND_UNA = SEG_ACK
 
 				// Update state
 				tcb.State = socket.ESTABLISHED
@@ -154,6 +156,7 @@ func _activeHandShake(tcb *proto.TCB, i int) bool {
 				// Set the connection state variables
 				tcb.IRS = SEG_SEQ
 				tcb.RCV_NXT = SEG_SEQ + 1
+				tcb.LBR = SEG_SEQ
 				tcb.SND_UNA = SEG_ACK
 				if tcb.SND_UNA <= tcb.ISS {
 					// - Not ACK for our SYN
@@ -163,11 +166,74 @@ func _activeHandShake(tcb *proto.TCB, i int) bool {
 				// SYN is ACKed -> ESTABLISHED
 				tcb.State = socket.ESTABLISHED
 
+				// Set window variables
+				tcb.SND_WND = uint32(tcpPacket.TCPHeader.WindowSize)
+				tcb.SND_WL1 = SEG_SEQ
+				tcb.SND_WL2 = SEG_ACK
 				// Send ACK for SYN, ACK
 				// <SEQ=SND.NXT><ACK=RCV.NXT><CTL=ACK>
-				tcb.SendACKPacket(util.ACK)
+				tcb.SendACKPacket(util.ACK, []byte{})
 				// Handshake is complete
 				return true
+			}
+		}
+	}
+}
+
+func _doSend(tcb *proto.TCB, data []byte) {
+	// First get the usable window
+	U := tcb.GetUseableWND()
+	D := uint32(len(data))
+	for U < uint32(D) {
+		// Block until we have space to send 1 MSS
+		// Do it inside for-loop to be extra safe
+		<-tcb.SendSignal
+		U = tcb.GetUseableWND()
+	}
+	// We have space in the SND_WND to send the current data
+	// Send the packet out
+	hdr := util.CreateTCPHeader(tcb.Lport, tcb.Rport, tcb.SND_NXT,
+		tcb.RCV_NXT, proto.DEFAULT_DATAOFFSET, util.ACK,
+		uint16(tcb.GetAdvertisedWND()))
+	tcpPacket := &proto.TCPPacket{
+		LAddr:     tcb.Laddr,
+		RAddr:     tcb.Raddr,
+		TCPHeader: hdr,
+		Payload:   data,
+	}
+	// Construct Segment in case of retransmission
+	seg := &proto.Segment{
+		Packet: tcpPacket,
+		ACKed:  make(chan bool, 1),
+		RTT:    0.2, // TODO: hardcode for now
+	}
+	tcb.RetransmissionQ = append(tcb.RetransmissionQ, seg)
+
+	tcb.SendChan <- tcpPacket
+	// Update SND_NXT
+	tcb.SND_NXT += D
+	// Start the retransmissoin clock
+	go _monitorSegment(tcb, seg)
+}
+
+// Function that keeps retransmitting segment "seg" until
+// we get a signal that this segment is completely ACK'ed
+func _monitorSegment(tcb *proto.TCB, seg *proto.Segment) {
+	for {
+		dur, _ := time.ParseDuration(fmt.Sprintf("%fs", seg.RTT))
+		currRTO := time.NewTimer(dur)
+		select {
+		case <-currRTO.C:
+			{
+				// RTO -> Retransmit
+				seg.Mu.Lock()
+				fmt.Println("RETRANSMIT")
+				tcb.SendChan <- seg.Packet
+				seg.Mu.Unlock()
+			}
+		case <-seg.ACKed:
+			{
+				return
 			}
 		}
 	}
@@ -181,22 +247,65 @@ func _doSocket(tcb *proto.TCB) {
 		case tcpPacket, more := <-tcb.ReceiveChan:
 			{
 				if !more {
-					// CLOSED
 					// - RETRANS EXPIRE
 					// let the reaper reap
 					tcb.ReapChan <- tcb.SID
 					return
 				}
+
 				// First perform the Segment acceptability test
 				if !tcb.IsSegmentValid(tcpPacket) {
 					// If invalid send ACK in reply
 					// <SEQ=SND.NXT><ACK=RCV.NXT><CTL=ACK>
-					tcb.SendACKPacket(util.ACK)
+					tcb.SendACKPacket(util.ACK, []byte{})
 					// and drop
 					continue
 				}
 
-				// TODO: Make the segment "idealized segment"
+				SEG_SEQ := tcpPacket.TCPHeader.SeqNum
+				SEG_ACK := tcpPacket.TCPHeader.AckNum
+				SEG_LEN := uint32(len(tcpPacket.Payload))
+				SEG_DATA := tcpPacket.Payload
+
+				// When we get here, we are guaranteed that SEG_SEQ lies in valid space and we can receive at least a byte
+
+				available := tcb.GetAdvertisedWND()
+
+				// Check if early arrival
+				if SEG_SEQ > tcb.RCV_NXT {
+					fmt.Println("Early")
+					// Insert into EAQ
+					tcb.InsertEAQ(tcpPacket)
+					// ACK and continue
+					tcb.SendACKPacket(util.ACK, []byte{})
+					continue
+				}
+
+				// First we process segment data so that we are only working with stuff we are interested in
+				if SEG_LEN != 0 {
+					start := tcb.RCV_NXT - SEG_SEQ
+					// Then split the data
+					if start != 0 {
+						SEG_DATA = SEG_DATA[start:]
+						SEG_LEN = uint32(len(SEG_DATA))
+					}
+
+					// Then we check the window size to make sure we receive only what we can
+					end := min(available, SEG_LEN)
+					SEG_DATA = SEG_DATA[:end]
+					SEG_LEN = uint32(len(SEG_DATA))
+				}
+
+				// If possible merge early arrivals
+
+				// TODO: worry about it later
+				// if len(tcb.EarlyArrivals) != 0 && available != SEG_LEN {
+				// 	SEG_DATA = tcb.MergeEAQ(tcb.RCV_NXT+SEG_LEN-1, SEG_DATA)
+				// 	SEG_LEN = uint32(len(SEG_DATA))
+				// }
+
+				// Segment should be "idealized segment"
+				// RCV.NXT == SEG_SEQ && SEG_LEN < RCV_WND_SZ
 
 				// * Check ACK
 
@@ -205,94 +314,26 @@ func _doSocket(tcb *proto.TCB) {
 					continue
 				}
 
-				SEG_ACK := tcpPacket.TCPHeader.AckNum
-				SEG_SEQ := tcpPacket.TCPHeader.SeqNum
-				SEG_WND := tcpPacket.TCPHeader.WindowSize
-				// SEG_LEN := len(tcpPacket.Payload)
-
-				if SEG_ACK <= tcb.SND_UNA {
-					// Duplicate ACK (ignore)
-				} else if SEG_ACK > tcb.SND_NXT {
-					// ACK for unsent stuff (ACK and drop)
-					tcb.SendACKPacket(util.ACK)
+				proceed, forceQuit := _handleAckSeg(tcb, tcpPacket)
+				if forceQuit {
+					// LAST ACK
+					return
+				}
+				if !proceed {
+					// FUTURE ACK
 					continue
-				} else {
-					// Update send window
-					if tcb.SND_UNA <= SEG_ACK && SEG_ACK <= tcb.SND_NXT {
-						if tcb.SND_WL1 < SEG_SEQ || (tcb.SND_WL1 == SEG_SEQ && tcb.SND_WL2 <= SEG_ACK) {
-							tcb.SND_WND = uint32(SEG_WND)
-							tcb.SND_WL1 = SEG_SEQ
-							tcb.SND_WL2 = SEG_ACK
-						}
-					}
-					// Update the SND.UNA
-					tcb.SND_UNA = SEG_ACK
-					// TODO: update retranmission queue
-
 				}
 
-				var FIN_ACK_FLAG = (tcb.SND_NXT == SEG_ACK)
-
-				// If we are FIN_WAIT_1 check if this ACK is for FIN
-				if tcb.State == socket.FIN_WAIT_1 {
-					if FIN_ACK_FLAG {
-						// ACK for our FIN
-						tcb.FinOK <- true
-					}
-				}
-
-				// If we are CLOSING check if this ACK is for FIN
-				if tcb.State == socket.CLOSING {
-					if FIN_ACK_FLAG {
-						// ACK for our FIN
-						tcb.State = socket.TIME_WAIT
-					} else {
-						// O.W. ignore
-						continue
-					}
-				}
-
-				if tcb.State == socket.LAST_ACK {
-					if FIN_ACK_FLAG {
-						// ACK for our FIN
-						tcb.FinOK <- true
-						// LAST_ACK -> CLOSED
-						tcb.State = socket.CLOSED
-						// Delete TCB
-						tcb.ReapChan <- tcb.SID
-						return
-					}
-				}
-
-				// Retransmission of the remote FIN
-				if tcb.State == socket.TIME_WAIT {
-					// ACK it
-					tcb.SendACKPacket(util.ACK)
-					// restart the timer
-                    tcb.TimeReset <- true
-				}
-
-				// TODO: Process Segment Data
 				// ESTABLISHED, FIN_WAIT_1, and FIN_WAIT_2 can recv data
+				// - Here we know that whatever in SEG_DATA, we can receive them in full
 
-				switch tcb.State {
-				case socket.ESTABLISHED:
-					fallthrough
-				case socket.FIN_WAIT_1:
-					fallthrough
-				case socket.FIN_WAIT_2:
-					// if tcpPacket.TCPHeader.Flags&util.FIN!=0{
-					//     SEG_LEN++
-					// }
-					// tcb.RCV_NXT += uint32(SEG_LEN)
-					// tcb.SendACKPacket(util.ACK)
-					// TODO: Adjust window
-				default:
-					// For other states ignore the segment
-					break
+				if SEG_LEN != 0 {
+					_handleTextSeg(tcb, SEG_DATA, SEG_LEN)
 				}
 
 				// * Check FIN
+
+				var FIN_ACK_FLAG = (tcb.SND_NXT == SEG_ACK)
 
 				if tcpPacket.TCPHeader.Flags&util.FIN == 0 {
 					// ACK for our FIN
@@ -302,47 +343,174 @@ func _doSocket(tcb *proto.TCB) {
 					continue
 				}
 
-				if tcb.State == socket.LISTEN || tcb.State == socket.CLOSED || tcb.State == socket.SYN_SENT {
-					// SEG_SEQ cannot be validated -> drop the segment
-					continue
-				}
-
-				// Advance by 1 (FIN)
-				tcb.RCV_NXT = SEG_SEQ + 1
-				// Send ACK
-				tcb.SendACKPacket(util.ACK)
-
-				switch tcb.State {
-				case socket.SYN_RECEIVED:
-					fallthrough
-				case socket.ESTABLISHED:
-					tcb.State = socket.CLOSE_WAIT
-					break
-				case socket.FIN_WAIT_1:
-					if FIN_ACK_FLAG {
-						tcb.State = socket.TIME_WAIT
-                        // Start the timer
-						go _doTimeWait(tcb)
-					} else {
-						tcb.State = socket.CLOSING
-					}
-					break
-				case socket.FIN_WAIT_2:
-					tcb.State = socket.TIME_WAIT
-                    // Start the timer
-					go _doTimeWait(tcb)
-				case socket.TIME_WAIT:
-                    // Restart the timer
-					tcb.TimeReset <- true
-				default:
-					// Other states stay the same
-					break
-				}
+				_handleFinSeg(tcb, tcpPacket)
 			}
 		}
 	}
 }
 
+// Handle Segment Data
+func _handleTextSeg(tcb *proto.TCB, data []byte, len uint32) {
+	switch tcb.State {
+	case socket.ESTABLISHED:
+		fallthrough
+	case socket.FIN_WAIT_1:
+		fallthrough
+	case socket.FIN_WAIT_2:
+		// Put the data
+		tcb.RecvBuffer.Put(data)
+		// Increment RCV_NXT over the received data
+		tcb.RCV_NXT += len
+		// Send ACK for everything up until here
+		tcb.SendACKPacket(util.ACK, []byte{})
+		// Signal the reader
+		tcb.DataSignal <- true
+	default:
+		// For other states ignore the segment
+		break
+	}
+}
+
+// Handle FIN segment
+// Return false if dropping this segment
+func _handleFinSeg(tcb *proto.TCB, tcpPacket *proto.TCPPacket) bool {
+
+	SEG_ACK := tcpPacket.TCPHeader.AckNum
+
+	var FIN_ACK_FLAG = (tcb.SND_NXT == SEG_ACK)
+
+	if tcb.State == socket.LISTEN ||
+		tcb.State == socket.CLOSED ||
+		tcb.State == socket.SYN_SENT {
+		// SEG_SEQ cannot be validated -> drop the segment
+		return false
+	}
+
+	// Advance by 1 (FIN)
+	tcb.RCV_NXT += 1
+	// Send ACK
+	tcb.SendACKPacket(util.ACK, []byte{})
+
+	switch tcb.State {
+	case socket.SYN_RECEIVED:
+		fallthrough
+	case socket.ESTABLISHED:
+		tcb.State = socket.CLOSE_WAIT
+		break
+	case socket.FIN_WAIT_1:
+		if FIN_ACK_FLAG {
+			tcb.State = socket.TIME_WAIT
+			// Start the timer
+			go _doTimeWait(tcb)
+		} else {
+			tcb.State = socket.CLOSING
+		}
+		break
+	case socket.FIN_WAIT_2:
+		tcb.State = socket.TIME_WAIT
+		// Start the timer
+		go _doTimeWait(tcb)
+	case socket.TIME_WAIT:
+		// Restart the timer
+		tcb.TimeReset <- true
+	default:
+		// Other states stay the same
+		break
+	}
+	return true
+}
+
+// Handle ACK segment
+// Return false if dropping this segment
+// Return true in the second argument if socket closed
+func _handleAckSeg(tcb *proto.TCB, tcpPacket *proto.TCPPacket) (bool, bool) {
+
+	SEG_ACK := tcpPacket.TCPHeader.AckNum
+	SEG_SEQ := tcpPacket.TCPHeader.SeqNum
+	SEG_WND := tcpPacket.TCPHeader.WindowSize
+	SEG_LEN := uint32(len(tcpPacket.Payload))
+
+	var FIN_ACK_FLAG = (tcb.SND_NXT == SEG_ACK)
+
+	if tcb.SND_UNA < SEG_ACK && SEG_ACK <= tcb.SND_NXT {
+		// Update the SND.UNA
+		tcb.SND_UNA = SEG_ACK
+		// Signal the update to the manager
+		tcb.ACKSignal <- true
+	} else if tcb.SND_UNA >= SEG_ACK {
+		// check for duplicate ACK
+		// - three conds
+		//   - SND_UNA == SEG_ACK ()
+		//   - SEG_LEN == 0 (no data)
+		//   - SND_UNA != SND_NXT (unacked data)
+		if (tcb.SND_UNA == SEG_ACK) &&
+			(SEG_LEN == 0) &&
+			(tcb.SND_UNA != tcb.SND_NXT) {
+			fmt.Println("Duplicate ACK", "SEG_ACK=", SEG_ACK)
+		}
+	} else if SEG_ACK > tcb.SND_NXT {
+		// ACK for unsent stuff (ACK and drop)
+		tcb.SendACKPacket(util.ACK, []byte{})
+		fmt.Println("Unseen ACK", "SEG_ACK=", SEG_ACK, "SND_NXT=", tcb.SND_NXT)
+		return false, false
+	}
+
+	// Update send window
+	if tcb.SND_UNA <= SEG_ACK && SEG_ACK <= tcb.SND_NXT {
+		if tcb.SND_WL1 < SEG_SEQ || (tcb.SND_WL1 == SEG_SEQ && tcb.SND_WL2 <= SEG_ACK) {
+			tcb.SND_WL1 = SEG_SEQ
+			tcb.SND_WL2 = SEG_ACK
+		}
+		// Update the SND_WND
+		tcb.SND_WND = uint32(SEG_WND)
+	}
+
+	// If we are FIN_WAIT_1 check if this ACK is for FIN
+	if tcb.State == socket.FIN_WAIT_1 {
+		if FIN_ACK_FLAG {
+			// ACK for our FIN
+			tcb.FinOK <- true
+		}
+	}
+
+	// If we are CLOSING check if this ACK is for FIN
+	if tcb.State == socket.CLOSING {
+		if FIN_ACK_FLAG {
+			// ACK for our FIN
+			tcb.State = socket.TIME_WAIT
+		} else {
+			// O.W. ignore
+			return false, false
+		}
+	}
+
+	// If we are LAST_ACK, we just close
+	if tcb.State == socket.LAST_ACK {
+		if FIN_ACK_FLAG {
+			// ACK for our FIN
+			tcb.FinOK <- true
+			// LAST_ACK -> CLOSED
+			tcb.State = socket.CLOSED
+			// Delete TCB
+			tcb.ReapChan <- tcb.SID
+			return false, true
+		}
+	}
+
+	// Retransmission of the remote FIN
+	if tcb.State == socket.TIME_WAIT {
+		// ACK it
+		tcb.SendACKPacket(util.ACK, []byte{})
+		// restart the timer
+		tcb.TimeReset <- true
+	}
+
+	return true, false
+}
+
+// Function that TIME_WAIT socket will be in
+// Once the timer goes off, close the receive chan
+// If you get reset signal, reset the timer
 func _doTimeWait(tcb *proto.TCB) {
 reset:
 	timer := time.NewTimer(2 * MSL * time.Second)
@@ -356,12 +524,15 @@ reset:
 			}
 		case <-tcb.TimeReset:
 			{
-                goto reset
+				goto reset
 			}
 		}
 	}
 }
 
+// Active Close
+// Send a FIN packet to other side to let them know that
+// you are done sending data and ready to close the connection
 func _doActiveClose(tcb *proto.TCB) {
 	i := 1
 	if tcb.State == socket.CLOSE_WAIT {

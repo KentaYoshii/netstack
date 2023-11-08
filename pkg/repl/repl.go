@@ -209,7 +209,7 @@ func (r *Repl) handleSocketConnect(args []string) string {
 func (r *Repl) handleSocketSend(args []string) string {
 	var b strings.Builder
 
-	if len(args) != 3 {
+	if len(args) < 3 {
 		r.HostInfo.Logger.Error("Usage: s <sid> <payload>")
 		return ""
 	}
@@ -276,8 +276,12 @@ func (r *Repl) handleSocketReceive(args []string) string {
 	}
 
 	// read
-	buf := make([]byte, proto.MAX_WND_SIZE)
+	buf := make([]byte, numB)
 	bytes_read, err := socket_api.VRead(tcb, buf)
+	if err != nil {
+		r.HostInfo.Logger.Error(err.Error())
+		return ""
+	}
 
 	r.HostInfo.Logger.Info(fmt.Sprintf("%d bytes read from SID=%d, content=%s", 
 	bytes_read, tcb.SID, string(buf[:bytes_read])))
