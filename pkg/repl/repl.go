@@ -283,9 +283,9 @@ func (r *Repl) handleSocketReceive(args []string) string {
 		return ""
 	}
 
-	r.HostInfo.Logger.Info(fmt.Sprintf("%d bytes read from SID=%d, content=%s", 
-	bytes_read, tcb.SID, string(buf[:bytes_read])))
-	
+	r.HostInfo.Logger.Info(fmt.Sprintf("%d bytes read from SID=%d, content=%s",
+		bytes_read, tcb.SID, string(buf[:bytes_read])))
+
 	return b.String()
 }
 
@@ -365,6 +365,41 @@ func (r *Repl) handleSocketSendFile(args []string) string {
 		r.HostInfo.Logger.Error("Usage: sf <file path> <ip addr> <port>")
 		return ""
 	}
+
+	// Verify IP
+	ipAddr, err := netip.ParseAddr(args[2])
+	if err != nil {
+		r.HostInfo.Logger.Error(err.Error())
+		return ""
+	}
+
+	// Verify Port
+	port, err := strconv.Atoi(args[3])
+	if err != nil {
+		r.HostInfo.Logger.Error(err.Error())
+		return ""
+	}
+
+	if port < 0 || port > 65535 {
+		r.HostInfo.Logger.Error("Invalid range for port number")
+		return ""
+	}
+
+	// Get outgoing ip
+	link, valid := r.HostInfo.GetOutgoingLink(ipAddr)
+	if !valid {
+		return ""
+	}
+
+	// Active Open
+	conn, err := socket_api.VConnect(link.IPAddr, ipAddr, uint16(port))
+	if err != nil {
+		r.HostInfo.Logger.Error(err.Error())
+		return ""
+	}
+
+	go socket_api.SendFile(conn.TCB, args[1], r.HostInfo.Logger)
+
 	return b.String()
 }
 
@@ -375,6 +410,39 @@ func (r *Repl) handleSocketReceiveFile(args []string) string {
 
 	if len(args) != 3 {
 		r.HostInfo.Logger.Error("Usage: rf <dest file path> <port>")
+		return ""
+	}
+
+	// Verify Port
+	port, err := strconv.Atoi(args[2])
+	if err != nil {
+		r.HostInfo.Logger.Error(err.Error())
+		return ""
+	}
+
+	if port < 0 || port > 65535 {
+		r.HostInfo.Logger.Error("Invalid range for port number")
+		return ""
+	}
+
+	// Create Listen Socket (Passive Open)
+	listenSock, err := socket_api.VListen(uint16(port))
+	if err != nil {
+		r.HostInfo.Logger.Error(err.Error())
+		return ""
+	}
+
+	// For announcing new connections
+	listenSock.InfoChan = r.HostInfo.InfoChan
+
+	// Accept a single connection
+	tcb := listenSock.VAcceptOnce()
+
+	// Receive file
+	go socket_api.ReceiveFile(tcb, args[1], r.HostInfo.Logger)
+
+	if err = socket_api.VClose(listenSock.TCB); err != nil {
+		r.HostInfo.Logger.Error(err.Error())
 		return ""
 	}
 	return b.String()

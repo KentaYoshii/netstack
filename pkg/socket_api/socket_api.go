@@ -107,6 +107,51 @@ func (li *VTCPListener) VAccept() {
 	}
 }
 
+// Accept a single client
+func (li *VTCPListener) VAcceptOnce() *proto.TCB {
+	for {
+		tcpPacket, more := <-li.TCB.ReceiveChan
+
+		if !more {
+			// Channel closed
+			li.TCB.ReapChan <- li.TCB.SID
+			return nil
+		}
+		if (tcpPacket.TCPHeader.Flags & util.SYN) == 0 {
+			// Not SYN packet
+			continue
+		}
+
+		sid := proto.AllocSID()
+		isn := util.GetNewISN(proto.TCPStack.ISNCTR, tcpPacket.LAddr, tcpPacket.TCPHeader.DstPort, tcpPacket.RAddr, tcpPacket.TCPHeader.SrcPort)
+		newTCB := proto.CreateTCBForNormalSocket(sid, tcpPacket.LAddr, tcpPacket.TCPHeader.DstPort, tcpPacket.RAddr, tcpPacket.TCPHeader.SrcPort)
+		key := proto.CreateSocketTableKey(false, tcpPacket.LAddr, tcpPacket.TCPHeader.DstPort, tcpPacket.RAddr, tcpPacket.TCPHeader.SrcPort)
+		proto.AddSocketToTable(key, newTCB)
+		newTCB.State = socket.SYN_RECEIVED
+		newTCB.ISS = isn
+		newTCB.IRS = tcpPacket.TCPHeader.SeqNum
+		newTCB.SND_UNA = newTCB.ISS
+		newTCB.SND_NXT = newTCB.ISS + 1
+		newTCB.RCV_NXT = tcpPacket.TCPHeader.SeqNum + 1
+		newTCB.SND_WND = uint32(tcpPacket.TCPHeader.WindowSize)
+		newTCB.LBR = tcpPacket.TCPHeader.SeqNum
+		for i := 1; i < MAX_RETRANS+1; i++ {
+			suc := _passiveHandshake(newTCB, i)
+			if suc {
+				// Connection is established!
+				li.InfoChan <- fmt.Sprintf("New connection on SID=%d => Created new socket with SID=%d", li.TCB.SID, newTCB.SID)
+				go _doSocket(newTCB)
+				go newTCB.RQManager()
+				return newTCB
+			}
+			if i == MAX_RETRANS {
+				// If failed, remove the TCB
+				newTCB.ReapChan <- newTCB.SID
+			}
+		}
+	}
+}
+
 // ================= VTCPConn =========================
 
 // ACTIVE_OPEN
@@ -169,23 +214,20 @@ retry:
 // The returned error is nil on success, io.EOF if other side of connection has finished
 // or another error describing other failure cases.
 func VRead(tcb *proto.TCB, buf []byte) (int, error) {
-
-	// Socket State Check
-
 	if tcb.State == socket.LISTEN {
 		return 0, errors.New("error: remote socket unspecified")
 	}
-
-	// If Buffer is empty and
 	if tcb.State == socket.CLOSE_WAIT &&
-		tcb.GetUnreadBytes() == 0 {
-		// Other end done sending
+		(tcb.GetUnreadBytes())-1 == 0 {
+		// If Buffer is empty and the other end done sending
+		// -1 here because rcv.nxt reflects FIN ctl flag
 		return 0, errors.New("error: connection closing")
 	}
 
 	if tcb.State != socket.FIN_WAIT_1 &&
 		tcb.State != socket.FIN_WAIT_2 &&
-		tcb.State != socket.ESTABLISHED {
+		tcb.State != socket.ESTABLISHED &&
+		tcb.State != socket.CLOSE_WAIT {
 		return 0, errors.New("error: connection closing")
 	}
 
@@ -193,6 +235,14 @@ func VRead(tcb *proto.TCB, buf []byte) (int, error) {
 
 	// First check the recv buffer
 	for {
+		// Data is available
+		// Two cases:
+		// - normal data is available
+		// - other side done sending
+		if tcb.State == socket.CLOSE_WAIT &&
+			(tcb.GetUnreadBytes())-1 == 0 {
+			return 0, errors.New("EOF")
+		}
 		if tcb.GetUnreadBytes() == 0 {
 			// Block until signaled
 			<-tcb.DataSignal
@@ -204,6 +254,10 @@ func VRead(tcb *proto.TCB, buf []byte) (int, error) {
 	// If user wants to read 5 bytes but only 3 bytes
 	// were put, read that 3 bytes
 	toReadBytes := min(len(buf), int(tcb.GetUnreadBytes()))
+	if tcb.State == socket.CLOSE_WAIT &&
+		toReadBytes == int(tcb.GetUnreadBytes()) {
+		toReadBytes -= 1
+	}
 	tcb.RecvBuffer.Get(buf[:toReadBytes])
 	tcb.LBR += uint32(toReadBytes)
 
@@ -214,9 +268,6 @@ func VRead(tcb *proto.TCB, buf []byte) (int, error) {
 // BLOCK until all data are in the send buffer of the socket
 // Returns the number of bytes written to the connection.
 func VWrite(tcb *proto.TCB, data []byte) (int, error) {
-
-	// Socket State Check
-
 	if tcb.State == socket.LISTEN {
 		return 0, errors.New("error: remote socket unspecified")
 	}
@@ -231,7 +282,8 @@ func VWrite(tcb *proto.TCB, data []byte) (int, error) {
 	for totalSize > 0 {
 		// First get the current segment
 		currSEGLEN := min(totalSize, MAX_SEG_SIZE)
-		// Then send
+		// Send
+		// - This subr blocks until segment is in the send buffer
 		_doSend(tcb, data[bytesWritten:bytesWritten+currSEGLEN])
 		totalSize -= currSEGLEN
 		bytesWritten += currSEGLEN
@@ -242,46 +294,34 @@ func VWrite(tcb *proto.TCB, data []byte) (int, error) {
 
 // Initiates the connection termination process for this socket
 // All subsequent calls to VRead and VWrite on this socket should return an error
-// (NOTE)
 // VClose only initiates the close process, hence it is non-blocking.
 // VClose does not delete sockets
 func VClose(tcb *proto.TCB) error {
 
 	// LISTEN STATE
-	if tcb.State == socket.LISTEN {
-		close(tcb.ReceiveChan)
-		return nil
-	}
 
 	// SYN-SENT STATE
-	// Delete the TCB and return "error: closing" responses to any queued SENDs, or RECEIVEs.
-	// Currently, no way to test this as "c" command hangs
-	if tcb.State == socket.SYN_SENT {
-		// Close the Receive channel to signal CLOSE
+	// | -> Delete the TCB and return "error: closing" responses to any queued SENDs, or RECEIVEs.
+	// |    Currently, no way to test this as "c" command hangs
+	if tcb.State == socket.LISTEN ||
+		tcb.State == socket.SYN_SENT {
 		close(tcb.ReceiveChan)
 		return nil
 	}
 
 	// SYN-RECEIVED STATE
-
-	// If no SENDs have been issued and there is no pending data to send, then form a FIN segment and send it, and enter FIN-WAIT-1 state; otherwise, queue for processing after entering ESTABLISHED state.
-	if tcb.State == socket.SYN_RECEIVED {
-		// TODO: check
-		go _doActiveClose(tcb)
-		return nil
-	}
+	// | -> If no SENDs have been issued and there is no pending data to send,
+	// |    then form a FIN segment and send it, and enter FIN-WAIT-1 state;
+	// |    otherwise, queue for processing after entering ESTABLISHED state.
 
 	// ESTABLISHED STATE
-
-	// Queue this until all preceding SENDs have been segmentized, then form a FIN segment and send it. In any case, enter FIN-WAIT-1 state.
-	if tcb.State == socket.ESTABLISHED {
-		// TODO: check
-		go _doActiveClose(tcb)
-		return nil
-	}
+	// | -> Queue this until all preceding SENDs have been segmentized,
+	// |    then form a FIN segment and send it. In any case, enter FIN-WAIT-1 state.
 
 	// CLOSE_WAIT
-	if tcb.State == socket.CLOSE_WAIT {
+	if tcb.State == socket.SYN_RECEIVED ||
+		tcb.State == socket.ESTABLISHED ||
+		tcb.State == socket.CLOSE_WAIT {
 		go _doActiveClose(tcb)
 		return nil
 	}

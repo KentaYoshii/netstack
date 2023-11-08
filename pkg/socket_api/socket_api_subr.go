@@ -2,9 +2,12 @@ package socket_api
 
 import (
 	"fmt"
+	"io"
+	"log/slog"
 	"netstack/pkg/proto"
 	"netstack/pkg/socket"
 	"netstack/pkg/util"
+	"os"
 	"time"
 )
 
@@ -13,7 +16,7 @@ const (
 	MAX_RETRANS  = 3
 	RTO_LB       = 1
 	MSL          = 5
-	MAX_SEG_SIZE = 1400 - (util.HeaderLen - util.TcpHeaderLen)
+	MAX_SEG_SIZE = 1400 - 20 - 20
 )
 
 // Function that handles a hadnshake for PASSIVE OPEN
@@ -192,15 +195,7 @@ func _doSend(tcb *proto.TCB, data []byte) {
 	}
 	// We have space in the SND_WND to send the current data
 	// Send the packet out
-	hdr := util.CreateTCPHeader(tcb.Lport, tcb.Rport, tcb.SND_NXT,
-		tcb.RCV_NXT, proto.DEFAULT_DATAOFFSET, util.ACK,
-		uint16(tcb.GetAdvertisedWND()))
-	tcpPacket := &proto.TCPPacket{
-		LAddr:     tcb.Laddr,
-		RAddr:     tcb.Raddr,
-		TCPHeader: hdr,
-		Payload:   data,
-	}
+	tcpPacket := tcb.SendACKPacket(util.ACK, data)
 	// Construct Segment in case of retransmission
 	seg := &proto.Segment{
 		Packet: tcpPacket,
@@ -208,8 +203,6 @@ func _doSend(tcb *proto.TCB, data []byte) {
 		RTT:    0.2, // TODO: hardcode for now
 	}
 	tcb.RetransmissionQ = append(tcb.RetransmissionQ, seg)
-
-	tcb.SendChan <- tcpPacket
 	// Update SND_NXT
 	tcb.SND_NXT += D
 	// Start the retransmissoin clock
@@ -219,21 +212,24 @@ func _doSend(tcb *proto.TCB, data []byte) {
 // Function that keeps retransmitting segment "seg" until
 // we get a signal that this segment is completely ACK'ed
 func _monitorSegment(tcb *proto.TCB, seg *proto.Segment) {
+	seg_lb := seg.Packet.TCPHeader.SeqNum +
+		uint32(len(seg.Packet.Payload)) - 1
 	for {
 		dur, _ := time.ParseDuration(fmt.Sprintf("%fs", seg.RTT))
 		currRTO := time.NewTimer(dur)
 		select {
 		case <-currRTO.C:
 			{
+				// This segment is already ACK'ed
+				if seg_lb < tcb.SND_UNA {
+					return
+				}
 				// RTO -> Retransmit
-				seg.Mu.Lock()
-				fmt.Println("RETRANSMIT")
+				fmt.Println("Retransmit Segment SEG_SEQ",
+					seg.Packet.TCPHeader.SeqNum-tcb.ISS, "SND_UNA", tcb.SND_UNA-tcb.ISS)
+				seg.Packet.TCPHeader.WindowSize = uint16(tcb.GetAdvertisedWND())
+				seg.Packet.TCPHeader.AckNum = tcb.RCV_NXT
 				tcb.SendChan <- seg.Packet
-				seg.Mu.Unlock()
-			}
-		case <-seg.ACKed:
-			{
-				return
 			}
 		}
 	}
@@ -266,7 +262,7 @@ func _doSocket(tcb *proto.TCB) {
 
 				// ---- Early Arrivals Check ----
 				if SEG_SEQ > tcb.RCV_NXT {
-					fmt.Println("Early Arrival Packet, SEG_SEQ=", SEG_SEQ, "RCV_NXT=", tcb.RCV_NXT)
+					fmt.Println("Early Arrival Packet, SEG_SEQ=", SEG_SEQ-tcb.IRS, "RCV_NXT=", tcb.RCV_NXT-tcb.IRS)
 					tcb.InsertEAQ(tcpPacket)
 					tcb.SendACKPacket(util.ACK, []byte{})
 					continue
@@ -353,6 +349,8 @@ func _handleFinSeg(tcb *proto.TCB, tcpPacket *proto.TCPPacket) bool {
 
 	// Advance by 1 (FIN)
 	tcb.RCV_NXT += 1
+	// FIN is considered data
+	tcb.DataSignal <- true
 	// Send ACK
 	tcb.SendACKPacket(util.ACK, []byte{})
 
@@ -395,7 +393,6 @@ func _handleAckSeg(tcb *proto.TCB, tcpPacket *proto.TCPPacket) (bool, bool) {
 	}
 
 	SEG_ACK := tcpPacket.TCPHeader.AckNum
-	SEG_SEQ := tcpPacket.TCPHeader.SeqNum
 	SEG_WND := tcpPacket.TCPHeader.WindowSize
 	SEG_LEN := uint32(len(tcpPacket.Payload))
 
@@ -415,25 +412,28 @@ func _handleAckSeg(tcb *proto.TCB, tcpPacket *proto.TCPPacket) (bool, bool) {
 		if (tcb.SND_UNA == SEG_ACK) &&
 			(SEG_LEN == 0) &&
 			(tcb.SND_UNA != tcb.SND_NXT) {
-			fmt.Println("Duplicate ACK", "SEG_ACK=", SEG_ACK)
+			fmt.Println("Duplicate ACK", "SEG_ACK=", SEG_ACK-tcb.ISS)
 		}
 	} else if SEG_ACK > tcb.SND_NXT {
 		// ACK for unsent stuff (ACK and drop)
 		tcb.SendACKPacket(util.ACK, []byte{})
-		fmt.Println("Unseen ACK", "SEG_ACK=", SEG_ACK, "SND_NXT=", tcb.SND_NXT)
+		fmt.Println("Unseen ACK", "SEG_ACK=", SEG_ACK-tcb.ISS, "SND_NXT=", tcb.SND_NXT-tcb.ISS)
 		return false, false
 	}
 
 	// Update send window
 	if tcb.SND_UNA <= SEG_ACK && SEG_ACK <= tcb.SND_NXT {
-		if tcb.SND_WL1 < SEG_SEQ || (tcb.SND_WL1 == SEG_SEQ && tcb.SND_WL2 <= SEG_ACK) {
-			tcb.SND_WL1 = SEG_SEQ
-			tcb.SND_WL2 = SEG_ACK
+		// If window size is 0, we probe
+		if !tcb.ProbeStatus {
+			// Start the ZWP
 		}
 		// Update the SND_WND
+		prevWND := tcb.SND_WND
 		tcb.SND_WND = uint32(SEG_WND)
 		// Signal the window change
-		tcb.SendSignal <- true
+		if tcb.SND_WND != prevWND {
+			tcb.SendSignal <- true
+		}
 	}
 
 	// If we are FIN_WAIT_1 check if this ACK is for FIN
@@ -477,6 +477,10 @@ func _handleAckSeg(tcb *proto.TCB, tcpPacket *proto.TCPPacket) (bool, bool) {
 	}
 
 	return true, false
+}
+
+func _doZWP() {
+	
 }
 
 // Function that TIME_WAIT socket will be in
@@ -546,5 +550,89 @@ sendFIN:
 				return
 			}
 		}
+	}
+}
+
+// Function that sends a file given by "filepath"
+func SendFile(tcb *proto.TCB, filepath string, l *slog.Logger) {
+	// Get the handle
+	f, err := os.Open(filepath)
+	if err != nil {
+		// File open fails
+		l.Error(err.Error())
+		err = VClose(tcb)
+		if err != nil {
+			// VClose fails
+			l.Error(err.Error())
+		}
+	}
+	defer f.Close()
+	buf := make([]byte, proto.MAX_WND_SIZE)
+	total := 0
+	l.Info("File opened, start sending file")
+	for {
+		// Read
+		bRead, err := f.Read(buf)
+		if err == io.EOF {
+			l.Info(fmt.Sprintf("Sent File! Wrote %d bytes", total))
+			break
+		}
+		if err != nil {
+			l.Error(err.Error())
+			break
+		}
+		bWritten, err := VWrite(tcb, buf[:bRead])
+		total += bWritten
+		if err != nil {
+			break
+		}
+	}
+	// Close the connection to let the other side know we are done sending
+	err = VClose(tcb)
+	if err != nil {
+		l.Error(err.Error())
+	}
+}
+
+// Function that receives a file
+func ReceiveFile(tcb *proto.TCB, dest string, l *slog.Logger) {
+	// Get the handle
+	f, err := os.Create(dest)
+	if err != nil {
+		// File open fails
+		l.Error(err.Error())
+		err = VClose(tcb)
+		if err != nil {
+			// VClose fails
+			l.Error(err.Error())
+		}
+	}
+	defer f.Close()
+	buf := make([]byte, proto.MAX_WND_SIZE)
+	total := 0
+	for {
+		// Receive
+		readBytes, err := VRead(tcb, buf)
+		total += readBytes
+		if err != nil {
+			if err.Error() == "EOF" {
+				l.Info(fmt.Sprintf("Received File! Read %d bytes", total))
+				break
+			} else {
+				l.Error(err.Error())
+				break
+			}
+		}
+		// Write to file
+		_, err = f.Write(buf[:readBytes])
+		if err != nil {
+			l.Error(err.Error())
+			break
+		}
+	}
+	// Close the connection
+	err = VClose(tcb)
+	if err != nil {
+		l.Error(err.Error())
 	}
 }

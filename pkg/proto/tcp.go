@@ -80,6 +80,9 @@ type TCB struct {
 
 	// Last Byte Read
 	LBR uint32
+
+	// Zero Window Probing
+	ProbeStatus bool
 }
 
 type SocketTableKey struct {
@@ -143,38 +146,35 @@ func (tcb *TCB) TrimSegment(tcpPacket *TCPPacket) ([]byte, uint32) {
 	return SEG_DATA, SEG_LEN
 }
 
-// Remove ACK'ed segments from the RTQ
 // Update RTO dynamically for segments that cannot be removed
 // We DON't partially update tcp packet payload
 func (tcb *TCB) RQManager() {
-	for {
-		// First Wait until we get a signal that SND.UNA has been updated
-		<-tcb.ACKSignal
-		newRQ := make([]*Segment, 0)
-		// For each segment check
-		// - Complete ACK -> (SEG.SEQ + SEG.LEN - 1 < SND.UNA)
-		//   - SEQ=3, LEN=3 -> (3,4,5) ok when SND.UNA >= 6
-		// - Else there is data not ACK'ed yet
-		for _, seg := range tcb.RetransmissionQ {
-			seg.Mu.Lock()
-			seg_seq := seg.Packet.TCPHeader.SeqNum
-			seg_len := uint32(len(seg.Packet.Payload))
-			seg_lb := seg_seq + seg_len - 1
-			if seg_lb < tcb.SND_UNA {
-				// This segment data ALL ACK'ed
-				seg.ACKed <- true
-			} else {
-				// The segment data is NOT FULLY ACK'ed
-				// TODO: update the RTO here
-				// Update Packet for RT
-				seg.Packet.TCPHeader.WindowSize = uint16(tcb.GetAdvertisedWND())
-				seg.Packet.TCPHeader.AckNum = tcb.RCV_NXT
-				newRQ = append(newRQ, seg)
-			}
-			seg.Mu.Unlock()
-		}
-		tcb.RetransmissionQ = newRQ
-	}
+	// for {
+	// 	// First Wait until we get a signal that SND.UNA has been updated
+	// 	<-tcb.ACKSignal
+	// 	newRQ := make([]*Segment, 0)
+	// 	// For each segment check
+	// 	// - Complete ACK -> (SEG.SEQ + SEG.LEN - 1 < SND.UNA)
+	// 	//   - SEQ=3, LEN=3 -> (3,4,5) ok when SND.UNA >= 6
+	// 	// - Else there is data not ACK'ed yet
+	// 	for _, seg := range tcb.RetransmissionQ {
+	// 		seg_seq := seg.Packet.TCPHeader.SeqNum
+	// 		seg_len := uint32(len(seg.Packet.Payload))
+	// 		seg_lb := seg_seq + seg_len - 1
+	// 		if seg_lb < tcb.SND_UNA {
+	// 			// This segment data ALL ACK'ed
+	// 			seg.ACKed <- true
+	// 		} else {
+	// 			// The segment data is NOT FULLY ACK'ed
+	// 			// TODO: update the RTO here
+	// 			// Update Packet for RT
+	// 			seg.Packet.TCPHeader.WindowSize = uint16(tcb.GetAdvertisedWND())
+	// 			seg.Packet.TCPHeader.AckNum = tcb.RCV_NXT
+	// 			newRQ = append(newRQ, seg)
+	// 		}
+	// 	}
+	// 	tcb.RetransmissionQ = newRQ
+	// }
 }
 
 // Insert so that Early Arrival Packets are in order of their sequence numbers
@@ -304,6 +304,11 @@ func (tcb *TCB) GetAdvertisedWND() uint32 {
 // Gets the number of unread bytes in the recv buffer
 func (tcb *TCB) GetUnreadBytes() uint32 {
 	return (tcb.RCV_NXT - 1) - tcb.LBR
+}
+
+// Send is done if retransmission queue is empty 
+func (tcb *TCB) IsSendDone() bool {
+	return len(tcb.RetransmissionQ) == 0
 }
 
 // Reap the sockets that expired
@@ -452,7 +457,7 @@ func CreateTCBForNormalSocket(sid int, laddr netip.Addr, lport uint16,
 		// Update to SND_WND
 		SendSignal: make(chan bool, 100),
 		// ACK signal
-		ACKSignal: make(chan bool, 100),
+		ACKSignal: make(chan bool, 1000),
 		// Data signal
 		DataSignal: make(chan bool, 100),
 		// Buffers
@@ -536,7 +541,7 @@ func HandleTCPProtocol(packet *packet.Packet, l *slog.Logger) {
 	tcpHdr.Checksum = 0
 	computedChecksum := util.ComputeTCPChecksum(&tcpHdr, packet.IPHeader.Src, packet.IPHeader.Dst, payload)
 	if fromHdr != computedChecksum {
-		l.Error("TCP Checusum is wrong")
+		l.Error(fmt.Sprintf("Checksum Incorrect: %d != %d", fromHdr, computedChecksum))
 		return
 	}
 	// Construct TCP Packet

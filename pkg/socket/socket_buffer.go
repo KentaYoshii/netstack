@@ -14,7 +14,6 @@ type CircularBuffer struct {
 	NextWrite int
     // Pointer to next get position
     NextRead int
-    
 }
 
 func InitCircularBuffer() *CircularBuffer {
