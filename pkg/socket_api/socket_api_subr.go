@@ -247,18 +247,14 @@ func _doSocket(tcb *proto.TCB) {
 		case tcpPacket, more := <-tcb.ReceiveChan:
 			{
 				if !more {
-					// - RETRANS EXPIRE
-					// let the reaper reap
+					// RETRANS EXPIRE
 					tcb.ReapChan <- tcb.SID
 					return
 				}
 
-				// First perform the Segment acceptability test
+				// ---- SEGMENT TEST ----
 				if !tcb.IsSegmentValid(tcpPacket) {
-					// If invalid send ACK in reply
-					// <SEQ=SND.NXT><ACK=RCV.NXT><CTL=ACK>
 					tcb.SendACKPacket(util.ACK, []byte{})
-					// and drop
 					continue
 				}
 
@@ -266,90 +262,59 @@ func _doSocket(tcb *proto.TCB) {
 				SEG_ACK := tcpPacket.TCPHeader.AckNum
 				SEG_LEN := uint32(len(tcpPacket.Payload))
 				SEG_DATA := tcpPacket.Payload
+				SEG_FLAG := tcpPacket.TCPHeader.Flags
 
-				// When we get here, we are guaranteed that SEG_SEQ lies in valid space and we can receive at least a byte
-
-				available := tcb.GetAdvertisedWND()
-
-				// Check if early arrival
+				// ---- Early Arrivals Check ----
 				if SEG_SEQ > tcb.RCV_NXT {
-					fmt.Println("Early")
-					// Insert into EAQ
+					fmt.Println("Early Arrival Packet, SEG_SEQ=", SEG_SEQ, "RCV_NXT=", tcb.RCV_NXT)
 					tcb.InsertEAQ(tcpPacket)
-					// ACK and continue
 					tcb.SendACKPacket(util.ACK, []byte{})
 					continue
 				}
 
-				// First we process segment data so that we are only working with stuff we are interested in
+				// ---- DATA Trimming ----
 				if SEG_LEN != 0 {
-					start := tcb.RCV_NXT - SEG_SEQ
-					// Then split the data
-					if start != 0 {
-						SEG_DATA = SEG_DATA[start:]
-						SEG_LEN = uint32(len(SEG_DATA))
-					}
-
-					// Then we check the window size to make sure we receive only what we can
-					end := min(available, SEG_LEN)
-					SEG_DATA = SEG_DATA[:end]
-					SEG_LEN = uint32(len(SEG_DATA))
+					SEG_DATA, SEG_LEN = tcb.TrimSegment(tcpPacket)
 				}
 
-				// If possible merge early arrivals
-
-				// TODO: worry about it later
-				// if len(tcb.EarlyArrivals) != 0 && available != SEG_LEN {
-				// 	SEG_DATA = tcb.MergeEAQ(tcb.RCV_NXT+SEG_LEN-1, SEG_DATA)
-				// 	SEG_LEN = uint32(len(SEG_DATA))
-				// }
-
-				// Segment should be "idealized segment"
-				// RCV.NXT == SEG_SEQ && SEG_LEN < RCV_WND_SZ
-
-				// * Check ACK
-
-				// If ACK bit is off drop
-				if tcpPacket.TCPHeader.Flags&util.ACK == 0 {
-					continue
+				// ---- MERGE EA (if possible) ----
+				if len(tcb.EarlyArrivals) != 0 {
+					SEG_DATA, SEG_LEN = tcb.MergeEAQ(tcb.RCV_NXT+SEG_LEN-1, SEG_DATA)
 				}
 
+				// ---- ACK ----
 				proceed, forceQuit := _handleAckSeg(tcb, tcpPacket)
 				if forceQuit {
-					// LAST ACK
 					return
 				}
 				if !proceed {
-					// FUTURE ACK
 					continue
 				}
 
-				// ESTABLISHED, FIN_WAIT_1, and FIN_WAIT_2 can recv data
-				// - Here we know that whatever in SEG_DATA, we can receive them in full
-
+				// ---- DATA ----
 				if SEG_LEN != 0 {
 					_handleTextSeg(tcb, SEG_DATA, SEG_LEN)
 				}
 
-				// * Check FIN
-
-				var FIN_ACK_FLAG = (tcb.SND_NXT == SEG_ACK)
-
-				if tcpPacket.TCPHeader.Flags&util.FIN == 0 {
+				// ---- FIN ----
+				if SEG_FLAG&util.FIN != 0 {
+					_handleFinSeg(tcb, tcpPacket)
+				} else {
 					// ACK for our FIN
-					if FIN_ACK_FLAG && tcb.State == socket.FIN_WAIT_1 {
+					if (tcb.SND_NXT == SEG_ACK) &&
+						tcb.State == socket.FIN_WAIT_1 {
 						tcb.State = socket.FIN_WAIT_2
 					}
-					continue
 				}
-
-				_handleFinSeg(tcb, tcpPacket)
 			}
 		}
 	}
 }
 
 // Handle Segment Data
+// Here we know that whatever in SEG_DATA, we can receive them in full
+// Additionally, segment should be "idealized segment"
+// RCV.NXT == SEG_SEQ && SEG_LEN < RCV_WND_SZ
 func _handleTextSeg(tcb *proto.TCB, data []byte, len uint32) {
 	switch tcb.State {
 	case socket.ESTABLISHED:
@@ -425,6 +390,10 @@ func _handleFinSeg(tcb *proto.TCB, tcpPacket *proto.TCPPacket) bool {
 // Return true in the second argument if socket closed
 func _handleAckSeg(tcb *proto.TCB, tcpPacket *proto.TCPPacket) (bool, bool) {
 
+	if tcpPacket.TCPHeader.Flags&util.ACK == 0 {
+		return false, false
+	}
+
 	SEG_ACK := tcpPacket.TCPHeader.AckNum
 	SEG_SEQ := tcpPacket.TCPHeader.SeqNum
 	SEG_WND := tcpPacket.TCPHeader.WindowSize
@@ -463,6 +432,8 @@ func _handleAckSeg(tcb *proto.TCB, tcpPacket *proto.TCPPacket) (bool, bool) {
 		}
 		// Update the SND_WND
 		tcb.SND_WND = uint32(SEG_WND)
+		// Signal the window change
+		tcb.SendSignal <- true
 	}
 
 	// If we are FIN_WAIT_1 check if this ACK is for FIN

@@ -128,6 +128,20 @@ func InitializeTCPStack(sendChan chan *TCPPacket) {
 }
 
 // =================== Helper ===================
+func (tcb *TCB) TrimSegment(tcpPacket *TCPPacket) ([]byte, uint32) {
+	SEG_SEQ := tcpPacket.TCPHeader.SeqNum
+	SEG_LEN := uint32(len(tcpPacket.Payload))
+	SEG_DATA := tcpPacket.Payload
+	available := tcb.GetAdvertisedWND()
+
+	// Compute the offset to the first new byte
+	start := tcb.RCV_NXT - SEG_SEQ
+	// Compute the number of bytes we can receive
+	end := min(available, SEG_LEN)
+	SEG_DATA = SEG_DATA[start:end]
+	SEG_LEN = uint32(len(SEG_DATA))
+	return SEG_DATA, SEG_LEN
+}
 
 // Remove ACK'ed segments from the RTQ
 // Update RTO dynamically for segments that cannot be removed
@@ -204,11 +218,14 @@ func (tcb *TCB) InsertEAQ(packet *TCPPacket) {
 	tcb.EarlyArrivals = q
 }
 
-// Given start sequence and end sequence number (incl.) of current segment data
+// Given end sequence number (incl.) of current segment data
 // Loop the EAQ and merge data
-func (tcb *TCB) MergeEAQ(end uint32, currData []byte) []byte {
-	// available space
+func (tcb *TCB) MergeEAQ(end uint32, currData []byte) ([]byte, uint32) {
 	available := tcb.GetAdvertisedWND() - uint32(len(currData))
+	if available == 0 {
+		// No space available in recv buf
+		return currData, uint32(len(currData))
+	}
 	for i, curr := range tcb.EarlyArrivals {
 		currSEQ := curr.TCPHeader.SeqNum
 		currEND := currSEQ + uint32(len(curr.Payload)) - 1
@@ -220,7 +237,7 @@ func (tcb *TCB) MergeEAQ(end uint32, currData []byte) []byte {
 			// not contiguous -> cannot receive
 			// - remove all the preceding segments
 			tcb.EarlyArrivals = tcb.EarlyArrivals[i:]
-			return currData
+			return currData, uint32(len(currData))
 		}
 		// Either currSEQ - 1 == end or
 		// end lies in [currSEQ, currEND]
@@ -246,14 +263,14 @@ func (tcb *TCB) MergeEAQ(end uint32, currData []byte) []byte {
 					tcb.EarlyArrivals = tcb.EarlyArrivals[i+1:]
 				}
 			}
-			return currData
+			return currData, uint32(len(currData))
 		}
 		end += uint32(mergeLen)
 	}
 
 	// If we get here we have merged everything and available > 0
 	tcb.EarlyArrivals = make([]*TCPPacket, 0)
-	return currData
+	return currData, uint32(len(currData))
 }
 
 // Get the useable window given a TCB state
@@ -330,11 +347,11 @@ func (tcb *TCB) PrintTCBState() {
 }
 
 func (tcb *TCB) PrintSegment(seg *TCPPacket) {
-	iss := tcb.ISS 
+	iss := tcb.ISS
 	irs := tcb.IRS
 	fmt.Println("----- SEGMENT -----")
-	fmt.Println("SEG_SEQ", seg.TCPHeader.SeqNum - irs)
-	fmt.Println("SEG_ACK", seg.TCPHeader.AckNum - iss)
+	fmt.Println("SEG_SEQ", seg.TCPHeader.SeqNum-irs)
+	fmt.Println("SEG_ACK", seg.TCPHeader.AckNum-iss)
 	fmt.Println("SEG_LEN", len(seg.Payload))
 	fmt.Println("SEG_WND", seg.TCPHeader.WindowSize)
 	fmt.Println("-------------------")
@@ -435,7 +452,7 @@ func CreateTCBForNormalSocket(sid int, laddr netip.Addr, lport uint16,
 		// Update to SND_WND
 		SendSignal: make(chan bool, 100),
 		// ACK signal
-		ACKSignal:  make(chan bool, 100),
+		ACKSignal: make(chan bool, 100),
 		// Data signal
 		DataSignal: make(chan bool, 100),
 		// Buffers
