@@ -283,8 +283,17 @@ func (tcb *TCB) MergeEAQ(end uint32, currData []byte) ([]byte, uint32) {
 }
 
 // Get the useable window given a TCB state
-func (tcb *TCB) GetUseableWND() uint32 {
+func (tcb *TCB) GetNumBytesInSNDWND() uint32 {
 	return tcb.SND_UNA + tcb.SND_WND - tcb.SND_NXT
+}
+
+// Gets the number of unsent bytes in the recv buffer
+//          n         l
+// [f f f f + + + + + +]
+// lbw = 9, snd_nx = 4 so 9 - 4 + 1 = 6 unsent bytes
+// 10 - 6 = 4 bytes that we can overwrite
+func (tcb *TCB) GetNumFreeBytesInSNDBUF() uint32 {
+	return MAX_WND_SIZE - (tcb.LBW - tcb.SND_NXT + 1)
 }
 
 // Get the advertised window given a TCB state
@@ -313,12 +322,6 @@ func (tcb *TCB) GetAdvertisedWND() uint32 {
 // Gets the number of unread bytes in the recv buffer
 func (tcb *TCB) GetUnreadBytes() uint32 {
 	return (tcb.RCV_NXT - 1) - tcb.LBR
-}
-
-// Gets the number of unsent bytes in the recv buffer
-// - - - - -
-func (tcb *TCB) GetSendableBytes() uint32 {
-	return (tcb.LBW - tcb.SND_NXT) + 1
 }
 
 // Send is done if retransmission queue is empty
@@ -567,7 +570,7 @@ func HandleTCPProtocol(packet *packet.Packet, l *slog.Logger) {
 	tcpHdr.Checksum = 0
 	computedChecksum := util.ComputeTCPChecksum(&tcpHdr, packet.IPHeader.Src, packet.IPHeader.Dst, payload)
 	if fromHdr != computedChecksum {
-		l.Error(fmt.Sprintf("Checksum Incorrect: %d != %d", fromHdr, computedChecksum))
+		l.Error(fmt.Sprintf("Checksum Incorrect: Packet SEQ=%d, LEN=%d", tcpHdr.SeqNum, len(payload)))
 		return
 	}
 	// Construct TCP Packet

@@ -189,6 +189,14 @@ func monitorSendBuffer(tcb *proto.TCB) {
 	for {
 		// While there is nothing to send out, go to sleep
 		d := <-tcb.SBufDataSignal
+		// Then check if we have space in snd wnd
+		U := tcb.GetNumBytesInSNDWND()
+		for U < d.NumB {
+			// Sleep until we are signalled that some of the in-flight 
+			// bytes have been ACK'ed
+			<- tcb.ACKSignal 
+			U = tcb.GetNumBytesInSNDWND()
+		}
 		buf := make([]byte, d.NumB)
 		// Get the bytes
 		tcb.SendBuffer.Get(buf)
@@ -204,7 +212,7 @@ func monitorSendBuffer(tcb *proto.TCB) {
 		seg := &proto.Segment{
 			Packet: tcpPacket,
 			ACKed:  make(chan bool, 1),
-			RTT:    0.2, // TODO: hardcode for now
+			RTT:    10, // TODO: hardcode for now
 		}
 		tcb.RetransmissionQ = append(tcb.RetransmissionQ, seg)
 
@@ -216,17 +224,16 @@ func monitorSendBuffer(tcb *proto.TCB) {
 // Function that puts data to buffer 
 // Blocks until send buffer has space
 func _doSend(tcb *proto.TCB, data []byte) {
-	// First get the usable window
-	U := tcb.GetUseableWND()
+	// First get the usable space in the send buffer
+	U := tcb.GetNumFreeBytesInSNDBUF()
 	D := uint32(len(data))
 	for U < uint32(D) {
 		// Block until we have space to put 1 MSS in the send buf
 		// Do it inside for-loop to be extra safe
 		<-tcb.SBufPutSignal
-		U = tcb.GetUseableWND()
+		U = tcb.GetNumFreeBytesInSNDBUF()
 	}
-	// We have space in the SND_WND to send the current data
-	// Put the data into the buffer
+	// We have space in the send buffer to put current data
 	tcb.SendBuffer.Put(data)
 	// Update LBW
 	tcb.LBW += D
@@ -243,7 +250,7 @@ func _monitorSegment(tcb *proto.TCB, seg *proto.Segment) {
 	seg_lb := seg.Packet.TCPHeader.SeqNum +
 		uint32(len(seg.Packet.Payload)) - 1
 	for {
-		dur, _ := time.ParseDuration(fmt.Sprintf("%fs", seg.RTT))
+		dur, _ := time.ParseDuration(fmt.Sprintf("%fms", seg.RTT))
 		currRTO := time.NewTimer(dur)
 		select {
 		case <-currRTO.C:
@@ -257,6 +264,7 @@ func _monitorSegment(tcb *proto.TCB, seg *proto.Segment) {
 					seg.Packet.TCPHeader.SeqNum-tcb.ISS, "SND_UNA", tcb.SND_UNA-tcb.ISS)
 				seg.Packet.TCPHeader.WindowSize = uint16(tcb.GetAdvertisedWND())
 				seg.Packet.TCPHeader.AckNum = tcb.RCV_NXT
+				seg.Packet.TCPHeader.Checksum = 0
 				tcb.SendChan <- seg.Packet
 			}
 		}
@@ -279,7 +287,7 @@ func _doSocket(tcb *proto.TCB) {
 				// ---- SEGMENT TEST ----
 				if !tcb.IsSegmentValid(tcpPacket) {
 					tcb.SendACKPacket(util.ACK, []byte{})
-					continue
+					return
 				}
 
 				SEG_SEQ := tcpPacket.TCPHeader.SeqNum
