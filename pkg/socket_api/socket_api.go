@@ -47,7 +47,7 @@ func VListen(port uint16) (*VTCPListener, error) {
 // VAccept waits for new TCP connections on the given listening socket
 // BLOCK until new connection is established
 // Returns the new normal socket represneting the connection or error
-func (li *VTCPListener) VAccept() {
+func (li *VTCPListener) VAccept(tcbChan chan *proto.TCB) {
 	// We will have a for loop that keeps monitoring the
 	// Receive Channel of listening socket
 	for {
@@ -82,6 +82,7 @@ func (li *VTCPListener) VAccept() {
 		// 3
 		newTCB.State = socket.SYN_RECEIVED
 		newTCB.ISS = isn
+		newTCB.LBW = isn
 		newTCB.IRS = tcpPacket.TCPHeader.SeqNum
 		newTCB.SND_UNA = newTCB.ISS
 		newTCB.SND_NXT = newTCB.ISS + 1
@@ -96,53 +97,10 @@ func (li *VTCPListener) VAccept() {
 				li.InfoChan <- fmt.Sprintf("New connection on SID=%d => Created new socket with SID=%d", li.TCB.SID, newTCB.SID)
 				// 5
 				go _doSocket(newTCB)
+				go monitorSendBuffer(newTCB)
 				go newTCB.RQManager()
+				tcbChan <- newTCB
 				break
-			}
-			if i == MAX_RETRANS {
-				// If failed, remove the TCB
-				newTCB.ReapChan <- newTCB.SID
-			}
-		}
-	}
-}
-
-// Accept a single client
-func (li *VTCPListener) VAcceptOnce() *proto.TCB {
-	for {
-		tcpPacket, more := <-li.TCB.ReceiveChan
-
-		if !more {
-			// Channel closed
-			li.TCB.ReapChan <- li.TCB.SID
-			return nil
-		}
-		if (tcpPacket.TCPHeader.Flags & util.SYN) == 0 {
-			// Not SYN packet
-			continue
-		}
-
-		sid := proto.AllocSID()
-		isn := util.GetNewISN(proto.TCPStack.ISNCTR, tcpPacket.LAddr, tcpPacket.TCPHeader.DstPort, tcpPacket.RAddr, tcpPacket.TCPHeader.SrcPort)
-		newTCB := proto.CreateTCBForNormalSocket(sid, tcpPacket.LAddr, tcpPacket.TCPHeader.DstPort, tcpPacket.RAddr, tcpPacket.TCPHeader.SrcPort)
-		key := proto.CreateSocketTableKey(false, tcpPacket.LAddr, tcpPacket.TCPHeader.DstPort, tcpPacket.RAddr, tcpPacket.TCPHeader.SrcPort)
-		proto.AddSocketToTable(key, newTCB)
-		newTCB.State = socket.SYN_RECEIVED
-		newTCB.ISS = isn
-		newTCB.IRS = tcpPacket.TCPHeader.SeqNum
-		newTCB.SND_UNA = newTCB.ISS
-		newTCB.SND_NXT = newTCB.ISS + 1
-		newTCB.RCV_NXT = tcpPacket.TCPHeader.SeqNum + 1
-		newTCB.SND_WND = uint32(tcpPacket.TCPHeader.WindowSize)
-		newTCB.LBR = tcpPacket.TCPHeader.SeqNum
-		for i := 1; i < MAX_RETRANS+1; i++ {
-			suc := _passiveHandshake(newTCB, i)
-			if suc {
-				// Connection is established!
-				li.InfoChan <- fmt.Sprintf("New connection on SID=%d => Created new socket with SID=%d", li.TCB.SID, newTCB.SID)
-				go _doSocket(newTCB)
-				go newTCB.RQManager()
-				return newTCB
 			}
 			if i == MAX_RETRANS {
 				// If failed, remove the TCB
@@ -187,6 +145,7 @@ retry:
 	tcb.ISS = iss
 	tcb.SND_UNA = iss
 	tcb.SND_NXT = iss + 1
+	tcb.LBW = iss
 	// 4
 	for i := 1; i < MAX_RETRANS+1; i++ {
 		suc := _activeHandShake(tcb, i)
@@ -194,6 +153,7 @@ retry:
 			// SYN was ACK'ed
 			// Dispatch this socket
 			go _doSocket(tcb)
+			go monitorSendBuffer(tcb)
 			go tcb.RQManager()
 			// Return the conn
 			return &VTCPConn{
@@ -245,7 +205,7 @@ func VRead(tcb *proto.TCB, buf []byte) (int, error) {
 		}
 		if tcb.GetUnreadBytes() == 0 {
 			// Block until signaled
-			<-tcb.DataSignal
+			<-tcb.RBufDataSignal
 		} else {
 			break
 		}

@@ -31,6 +31,11 @@ type TCPPacket struct {
 	Payload   []byte
 }
 
+type SendBufData struct {
+	NumB uint32
+	Flag uint8
+}
+
 type TCB struct {
 	SID   int // Socket Id
 	State int // Socket State
@@ -50,12 +55,14 @@ type TCB struct {
 	TimeReset chan bool
 	// Signal the Reaper for removeal
 	ReapChan chan int
-	// Update to SND_WND
-	SendSignal chan bool
 	// ACK signal
 	ACKSignal chan bool
 	// Data signal
-	DataSignal chan bool
+
+	SBufDataSignal chan SendBufData
+	SBufPutSignal  chan bool
+
+	RBufDataSignal chan bool
 
 	// Pointers to Buffers
 	SendBuffer *socket.CircularBuffer
@@ -80,6 +87,8 @@ type TCB struct {
 
 	// Last Byte Read
 	LBR uint32
+	// Last Byte Written
+	LBW uint32
 
 	// Zero Window Probing
 	ProbeStatus bool
@@ -306,7 +315,13 @@ func (tcb *TCB) GetUnreadBytes() uint32 {
 	return (tcb.RCV_NXT - 1) - tcb.LBR
 }
 
-// Send is done if retransmission queue is empty 
+// Gets the number of unsent bytes in the recv buffer
+// - - - - -
+func (tcb *TCB) GetSendableBytes() uint32 {
+	return (tcb.LBW - tcb.SND_NXT) + 1
+}
+
+// Send is done if retransmission queue is empty
 func (tcb *TCB) IsSendDone() bool {
 	return len(tcb.RetransmissionQ) == 0
 }
@@ -347,8 +362,20 @@ func (tcb *TCB) PrintTCBState() {
 	fmt.Println("SND_WND", tcb.SND_WND)
 	fmt.Println("RCV_NXT", tcb.RCV_NXT-irs)
 	fmt.Println("RCV_WND", tcb.RCV_WND)
-	fmt.Println("LBR", tcb.LBR)
+	fmt.Println("LBR", tcb.LBR-irs)
+	fmt.Println("LBW", tcb.LBW-iss)
 	fmt.Println("---------------------")
+}
+
+func (tcb *TCB) PrintOutgoingSegment(seg *TCPPacket) {
+	iss := tcb.ISS
+	irs := tcb.IRS
+	fmt.Println("----- SEGMENT -----")
+	fmt.Println("SEG_SEQ", seg.TCPHeader.SeqNum-iss)
+	fmt.Println("SEG_ACK", seg.TCPHeader.AckNum-irs)
+	fmt.Println("SEG_LEN", len(seg.Payload))
+	fmt.Println("SEG_WND", seg.TCPHeader.WindowSize)
+	fmt.Println("-------------------")
 }
 
 func (tcb *TCB) PrintSegment(seg *TCPPacket) {
@@ -454,12 +481,11 @@ func CreateTCBForNormalSocket(sid int, laddr netip.Addr, lport uint16,
 		TimeReset: make(chan bool, 100),
 		// Signal the reaper to reap sent SID
 		ReapChan: TCPStack.ReapChan,
-		// Update to SND_WND
-		SendSignal: make(chan bool, 100),
 		// ACK signal
-		ACKSignal: make(chan bool, 1000),
-		// Data signal
-		DataSignal: make(chan bool, 100),
+		ACKSignal:      make(chan bool, 100),
+		SBufDataSignal: make(chan SendBufData, 100),
+		SBufPutSignal:  make(chan bool, 100),
+		RBufDataSignal: make(chan bool, 100),
 		// Buffers
 		SendBuffer: socket.InitCircularBuffer(),
 		RecvBuffer: socket.InitCircularBuffer(),

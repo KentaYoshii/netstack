@@ -152,7 +152,7 @@ func (r *Repl) handleSocketListenAndAccept(args []string) string {
 	listenSock.InfoChan = r.HostInfo.InfoChan
 
 	// Start accepting
-	go listenSock.VAccept()
+	go listenSock.VAccept(nil)
 
 	b.WriteString(fmt.Sprintf("Created listen socket with SID=%d\n", listenSock.TCB.SID))
 	return b.String()
@@ -436,7 +436,9 @@ func (r *Repl) handleSocketReceiveFile(args []string) string {
 	listenSock.InfoChan = r.HostInfo.InfoChan
 
 	// Accept a single connection
-	tcb := listenSock.VAcceptOnce()
+	tcbChan := make(chan *proto.TCB)
+	go listenSock.VAccept(tcbChan)
+	tcb := <- tcbChan
 
 	// Receive file
 	go socket_api.ReceiveFile(tcb, args[1], r.HostInfo.Logger)
