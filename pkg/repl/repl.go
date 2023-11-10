@@ -582,6 +582,8 @@ func (r *Repl) handleHelp(args []string) string {
 		b.WriteString(fmt.Sprintf("%-6s %-15s\n", "ls", "List socket table"))
 		b.WriteString(fmt.Sprintf("%-6s %-15s\n", "sf", "Send a file to the socket"))
 		b.WriteString(fmt.Sprintf("%-6s %-15s\n", "rf", "Read a file from the socket"))
+	} else {
+		b.WriteString(fmt.Sprintf("%-6s %-15s\n", "lossy", "Set the drop late of the router"))
 	}
 	return b.String()
 }

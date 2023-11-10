@@ -192,9 +192,9 @@ func monitorSendBuffer(tcb *proto.TCB) {
 		// Then check if we have space in snd wnd
 		U := tcb.GetNumBytesInSNDWND()
 		for U < d.NumB {
-			// Sleep until we are signalled that some of the in-flight 
+			// Sleep until we are signalled that some of the in-flight
 			// bytes have been ACK'ed
-			<- tcb.ACKSignal 
+			<-tcb.ACKSignal
 			U = tcb.GetNumBytesInSNDWND()
 		}
 		buf := make([]byte, d.NumB)
@@ -204,7 +204,7 @@ func monitorSendBuffer(tcb *proto.TCB) {
 		tcpPacket := tcb.SendACKPacket(d.Flag, buf)
 		// Update SND_NXT
 		tcb.SND_NXT += d.NumB
-		if d.Flag & util.FIN != 0 {
+		if d.Flag&util.FIN != 0 {
 			// If it is FIN then advance one more
 			tcb.SND_NXT = tcb.SND_NXT + 1
 		}
@@ -221,7 +221,7 @@ func monitorSendBuffer(tcb *proto.TCB) {
 	}
 }
 
-// Function that puts data to buffer 
+// Function that puts data to buffer
 // Blocks until send buffer has space
 func _doSend(tcb *proto.TCB, data []byte) {
 	// First get the usable space in the send buffer
@@ -238,7 +238,7 @@ func _doSend(tcb *proto.TCB, data []byte) {
 	// Update LBW
 	tcb.LBW += D
 	// Signal the monitoror about the new data
-	tcb.SBufDataSignal <- proto.SendBufData {
+	tcb.SBufDataSignal <- proto.SendBufData{
 		NumB: D,
 		Flag: util.ACK,
 	}
@@ -260,8 +260,6 @@ func _monitorSegment(tcb *proto.TCB, seg *proto.Segment) {
 					return
 				}
 				// RTO -> Retransmit
-				fmt.Println("Retransmit Segment SEG_SEQ",
-					seg.Packet.TCPHeader.SeqNum-tcb.ISS, "SND_UNA", tcb.SND_UNA-tcb.ISS)
 				seg.Packet.TCPHeader.WindowSize = uint16(tcb.GetAdvertisedWND())
 				seg.Packet.TCPHeader.AckNum = tcb.RCV_NXT
 				seg.Packet.TCPHeader.Checksum = 0
@@ -287,7 +285,7 @@ func _doSocket(tcb *proto.TCB) {
 				// ---- SEGMENT TEST ----
 				if !tcb.IsSegmentValid(tcpPacket) {
 					tcb.SendACKPacket(util.ACK, []byte{})
-					return
+					continue
 				}
 
 				SEG_SEQ := tcpPacket.TCPHeader.SeqNum
@@ -298,7 +296,6 @@ func _doSocket(tcb *proto.TCB) {
 
 				// ---- Early Arrivals Check ----
 				if SEG_SEQ > tcb.RCV_NXT {
-					fmt.Println("Early Arrival Packet, SEG_SEQ=", SEG_SEQ-tcb.IRS, "RCV_NXT=", tcb.RCV_NXT-tcb.IRS)
 					tcb.InsertEAQ(tcpPacket)
 					tcb.SendACKPacket(util.ACK, []byte{})
 					continue
@@ -311,7 +308,7 @@ func _doSocket(tcb *proto.TCB) {
 
 				// ---- MERGE EA (if possible) ----
 				if len(tcb.EarlyArrivals) != 0 {
-					SEG_DATA, SEG_LEN = tcb.MergeEAQ(tcb.RCV_NXT+SEG_LEN-1, SEG_DATA)
+					SEG_DATA, SEG_LEN = tcb.MergeEAQ(tcb.RCV_NXT+SEG_LEN, SEG_DATA)
 				}
 
 				// ---- ACK ----
@@ -347,7 +344,7 @@ func _doSocket(tcb *proto.TCB) {
 // Here we know that whatever in SEG_DATA, we can receive them in full
 // Additionally, segment should be "idealized segment"
 // RCV.NXT == SEG_SEQ && SEG_LEN < RCV_WND_SZ
-func _handleTextSeg(tcb *proto.TCB, data []byte, len uint32) {
+func _handleTextSeg(tcb *proto.TCB, data []byte, dlen uint32) {
 	switch tcb.State {
 	case socket.ESTABLISHED:
 		fallthrough
@@ -357,9 +354,12 @@ func _handleTextSeg(tcb *proto.TCB, data []byte, len uint32) {
 		// Put the data
 		tcb.RecvBuffer.Put(data)
 		// Increment RCV_NXT over the received data
-		tcb.RCV_NXT += len
+		tcb.RCV_NXT += dlen
 		// Send ACK for everything up until here
 		tcb.SendACKPacket(util.ACK, []byte{})
+		if len(tcb.EarlyArrivals) != 0 {
+			fmt.Println(fmt.Sprintf("Current RCV.NXT=%d, SEQ in EAQ[0]=%d", tcb.RCV_NXT-tcb.IRS, tcb.EarlyArrivals[0].TCPHeader.SeqNum-tcb.IRS))
+		}
 		// Signal the reader
 		tcb.RBufDataSignal <- true
 	default:

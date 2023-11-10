@@ -194,10 +194,10 @@ func (tcb *TCB) RQManager() {
 // - Append a temp slice 1 4 5 6 temp
 // - Copy (1 4 4 5 6) and update insert pos
 // - Result is 1 3 4 5 6
-func (tcb *TCB) InsertEAQ(packet *TCPPacket) {
+func (tcb *TCB) InsertEAQ(packet *TCPPacket) bool {
 	if len(tcb.EarlyArrivals) == 0 {
 		tcb.EarlyArrivals = append(tcb.EarlyArrivals, packet)
-		return
+		return true
 	}
 	insertPos := 0
 	found := false
@@ -205,7 +205,7 @@ func (tcb *TCB) InsertEAQ(packet *TCPPacket) {
 	for i, curr := range tcb.EarlyArrivals {
 		if insertSeq == curr.TCPHeader.SeqNum {
 			// We already have this in our early arrivals queue => nop
-			return
+			return false
 		}
 		if curr.TCPHeader.SeqNum > insertSeq {
 			// We find our insert position
@@ -216,20 +216,24 @@ func (tcb *TCB) InsertEAQ(packet *TCPPacket) {
 	}
 	var q []*TCPPacket
 	if !found {
-		// append at the end
+		// Append
 		q = append(tcb.EarlyArrivals, packet)
 	} else {
-		// insert
-		q := append(tcb.EarlyArrivals, &TCPPacket{})
-		copy(q[insertPos+1:], q[insertPos:])
-		q[insertPos] = packet
+		// Insert
+		// the ones before
+		q = append(q, tcb.EarlyArrivals[:insertPos]...)
+		// the newcomer
+		q = append(q, packet)
+		// the ones later
+		q = append(q, tcb.EarlyArrivals[insertPos:]...)
 	}
 	tcb.EarlyArrivals = q
+	return true
 }
 
 // Given end sequence number (incl.) of current segment data
 // Loop the EAQ and merge data
-func (tcb *TCB) MergeEAQ(end uint32, currData []byte) ([]byte, uint32) {
+func (tcb *TCB) MergeEAQ(start uint32, currData []byte) ([]byte, uint32) {
 	available := tcb.GetAdvertisedWND() - uint32(len(currData))
 	if available == 0 {
 		// No space available in recv buf
@@ -238,43 +242,57 @@ func (tcb *TCB) MergeEAQ(end uint32, currData []byte) ([]byte, uint32) {
 	for i, curr := range tcb.EarlyArrivals {
 		currSEQ := curr.TCPHeader.SeqNum
 		currEND := currSEQ + uint32(len(curr.Payload)) - 1
-		if currEND <= end {
+		if currEND < start {
 			// already received
 			continue
 		}
-		if currSEQ > end+1 {
+		if currSEQ > start {
 			// not contiguous -> cannot receive
 			// - remove all the preceding segments
 			tcb.EarlyArrivals = tcb.EarlyArrivals[i:]
 			return currData, uint32(len(currData))
 		}
-		// Either currSEQ - 1 == end or
-		// end lies in [currSEQ, currEND]
-		mergeLen := min(int(available), len(curr.Payload))
-		// Get the offset
-		off := ((end + 1) - currSEQ)
-		// Get the data
-		mergeData := curr.Payload[off : off+uint32(mergeLen)]
-		currData = append(currData, mergeData...)
-		available -= uint32(mergeLen)
-		if available == 0 {
-			if mergeLen != len(curr.Payload) {
-				// we have not completely merged this segment
-				tcb.EarlyArrivals = tcb.EarlyArrivals[i:]
+
+		// Either
+		// - currSEQ == start
+		// - currSEQ < start <= currEND
+
+		// Trim the data first
+		d := curr.Payload[start-currSEQ:]
+		// Check how many bytes we can merge
+		mLen := min(int(available), len(d))
+		// Append the data
+		currData = append(currData, d[:mLen]...)
+		// Reflect the update
+		available -= uint32(mLen)
+		// Update pointer to next byte to be merge
+		start += uint32(mLen)
+		// Check if we can merge more
+		if available != 0 {
+			continue
+		}
+
+		// If we cannot merge, then we trim the EAQs
+		// Two cases:
+		// - Complete merge
+		// - Partial merge
+
+		if currEND < start {
+			// Complete merge
+			// -> rm up until and including this current segment
+			if i == len(tcb.EarlyArrivals)-1 {
+				// If last element, simply reset the queue
+				tcb.EarlyArrivals = make([]*TCPPacket, 0)
 			} else {
-				// we completely merged this segment
-				if i == len(tcb.EarlyArrivals)-1 {
-					// if this is the last segment
-					// we know we are done with this queue
-					tcb.EarlyArrivals = make([]*TCPPacket, 0)
-				} else {
-					// if not, remove self and go on
-					tcb.EarlyArrivals = tcb.EarlyArrivals[i+1:]
-				}
+				tcb.EarlyArrivals = tcb.EarlyArrivals[i+1:]
 			}
 			return currData, uint32(len(currData))
 		}
-		end += uint32(mergeLen)
+
+		// Partial merge
+		// -> rm up until and excluding this segment from the queue
+		tcb.EarlyArrivals = tcb.EarlyArrivals[i:]
+		return currData, uint32(len(currData))
 	}
 
 	// If we get here we have merged everything and available > 0
@@ -288,7 +306,9 @@ func (tcb *TCB) GetNumBytesInSNDWND() uint32 {
 }
 
 // Gets the number of unsent bytes in the recv buffer
-//          n         l
+//
+//	n         l
+//
 // [f f f f + + + + + +]
 // lbw = 9, snd_nx = 4 so 9 - 4 + 1 = 6 unsent bytes
 // 10 - 6 = 4 bytes that we can overwrite
@@ -433,12 +453,16 @@ func (tcb *TCB) IsSegmentValid(tcpPacket *TCPPacket) bool {
 
 // Look up on socket table
 func SocketTableLookup(key SocketTableKey) (*TCB, bool) {
+	TCPStack.StMtx.Lock()
+	defer TCPStack.StMtx.Unlock()
 	tcb, ok := TCPStack.SocketTable[key]
 	return tcb, ok
 }
 
 // Given a SID, return the TCB
 func SIDToTCB(sid int) (*TCB, bool) {
+	TCPStack.StMtx.Lock()
+	defer TCPStack.StMtx.Unlock()
 	key, ok := TCPStack.SIDToTableKey[sid]
 	if !ok {
 		return nil, false
