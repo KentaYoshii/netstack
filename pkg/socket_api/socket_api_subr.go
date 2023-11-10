@@ -17,6 +17,7 @@ const (
 	RTO_LB       = 1
 	MSL          = 5
 	MAX_SEG_SIZE = 1400 - 20 - 20
+	ZWP_TO       = 100
 )
 
 // Function that handles a hadnshake for PASSIVE OPEN
@@ -85,8 +86,6 @@ func _passiveHandshake(tcb *proto.TCB, i int) bool {
 
 				// Set the connection state variables
 				tcb.SND_WND = uint32(reply.TCPHeader.WindowSize)
-				tcb.SND_WL1 = reply.TCPHeader.SeqNum
-				tcb.SND_WL2 = reply.TCPHeader.AckNum
 
 				return true
 			}
@@ -171,8 +170,6 @@ func _activeHandShake(tcb *proto.TCB, i int) bool {
 
 				// Set window variables
 				tcb.SND_WND = uint32(tcpPacket.TCPHeader.WindowSize)
-				tcb.SND_WL1 = SEG_SEQ
-				tcb.SND_WL2 = SEG_ACK
 				// Send ACK for SYN, ACK
 				// <SEQ=SND.NXT><ACK=RCV.NXT><CTL=ACK>
 				tcb.SendACKPacket(util.ACK, []byte{})
@@ -204,20 +201,25 @@ func monitorSendBuffer(tcb *proto.TCB) {
 		tcpPacket := tcb.SendACKPacket(d.Flag, buf)
 		// Update SND_NXT
 		tcb.SND_NXT += d.NumB
+
 		if d.Flag&util.FIN != 0 {
 			// If it is FIN then advance one more
 			tcb.SND_NXT = tcb.SND_NXT + 1
 		}
-		// Construct Segment in case of retransmission
-		seg := &proto.Segment{
-			Packet: tcpPacket,
-			ACKed:  make(chan bool, 1),
-			RTT:    10, // TODO: hardcode for now
-		}
-		tcb.RetransmissionQ = append(tcb.RetransmissionQ, seg)
 
-		// Start the retransmissoin clock
-		go _monitorSegment(tcb, seg)
+		// Add to RQ and start the retransmissoin clock
+		// - RTT sample can only be taken for normal packet
+		tcb.RQMu.Lock()
+		tcb.RetransmissionQ = append(tcb.RetransmissionQ, &proto.RQSegment{
+			Packet:       tcpPacket,
+			SentAt:       time.Now(),
+			IsRetransmit: false,
+		})
+		tcb.RQMu.Unlock()
+		if !tcb.RTOStatus {
+			// If timer is not running, start
+			tcb.StartRTO()
+		}
 	}
 }
 
@@ -241,31 +243,6 @@ func _doSend(tcb *proto.TCB, data []byte) {
 	tcb.SBufDataSignal <- proto.SendBufData{
 		NumB: D,
 		Flag: util.ACK,
-	}
-}
-
-// Function that keeps retransmitting segment "seg" until
-// we get a signal that this segment is completely ACK'ed
-func _monitorSegment(tcb *proto.TCB, seg *proto.Segment) {
-	seg_lb := seg.Packet.TCPHeader.SeqNum +
-		uint32(len(seg.Packet.Payload)) - 1
-	for {
-		dur, _ := time.ParseDuration(fmt.Sprintf("%fms", seg.RTT))
-		currRTO := time.NewTimer(dur)
-		select {
-		case <-currRTO.C:
-			{
-				// This segment is already ACK'ed
-				if seg_lb < tcb.SND_UNA {
-					return
-				}
-				// RTO -> Retransmit
-				seg.Packet.TCPHeader.WindowSize = uint16(tcb.GetAdvertisedWND())
-				seg.Packet.TCPHeader.AckNum = tcb.RCV_NXT
-				seg.Packet.TCPHeader.Checksum = 0
-				tcb.SendChan <- seg.Packet
-			}
-		}
 	}
 }
 
@@ -357,9 +334,6 @@ func _handleTextSeg(tcb *proto.TCB, data []byte, dlen uint32) {
 		tcb.RCV_NXT += dlen
 		// Send ACK for everything up until here
 		tcb.SendACKPacket(util.ACK, []byte{})
-		if len(tcb.EarlyArrivals) != 0 {
-			fmt.Println(fmt.Sprintf("Current RCV.NXT=%d, SEQ in EAQ[0]=%d", tcb.RCV_NXT-tcb.IRS, tcb.EarlyArrivals[0].TCPHeader.SeqNum-tcb.IRS))
-		}
 		// Signal the reader
 		tcb.RBufDataSignal <- true
 	default:
@@ -437,7 +411,14 @@ func _handleAckSeg(tcb *proto.TCB, tcpPacket *proto.TCPPacket) (bool, bool) {
 	if tcb.SND_UNA < SEG_ACK && SEG_ACK <= tcb.SND_NXT {
 		// Update the SND.UNA
 		tcb.SND_UNA = SEG_ACK
+		// (5.3) When an ACK is received that acknowledges
+		// new data, restart the retransmission timer so
+		// that it will expire after RTO seconds
+		tcb.StartRTO()
+		tcb.RTOStatus = true
 		// Signal the update to the manager
+		tcb.RQUpdateSignal <- true
+		// Signal the new space in send wnd
 		tcb.ACKSignal <- true
 	} else if tcb.SND_UNA >= SEG_ACK {
 		// check for duplicate ACK
@@ -460,8 +441,13 @@ func _handleAckSeg(tcb *proto.TCB, tcpPacket *proto.TCPPacket) (bool, bool) {
 	// Update send window
 	if tcb.SND_UNA <= SEG_ACK && SEG_ACK <= tcb.SND_NXT {
 		// If window size is 0, we probe
-		if !tcb.ProbeStatus {
-			// Start the ZWP
+		if SEG_WND == 0 && !tcb.ProbeStatus {
+			tcb.ProbeStatus = true
+			go _doZWP(tcb)
+		}
+		if SEG_WND != 0 && tcb.ProbeStatus {
+			tcb.ProbeStatus = false
+			tcb.ProbeStopSignal <- true
 		}
 		// Update the SND_WND
 		prevWND := tcb.SND_WND
@@ -515,8 +501,30 @@ func _handleAckSeg(tcb *proto.TCB, tcpPacket *proto.TCPPacket) (bool, bool) {
 	return true, false
 }
 
-func _doZWP() {
+// Function that does zero window probing
+func _doZWP(tcb *proto.TCB) {
+	// Get 1 byte data segment
 
+	// If Send Buffer is empty, then we can return
+	if tcb.GetNumFreeBytesInSNDBUF() == proto.MAX_WND_SIZE {
+		return
+	}
+	zwp_payload := [1]byte{}
+	tcb.SendBuffer.Peek(zwp_payload)
+
+	zwpTicker := time.NewTicker(time.Duration(int64(time.Millisecond) * ZWP_TO))
+	for {
+		select {
+		case <-tcb.ProbeStopSignal:
+			{
+				return
+			}
+		case <-zwpTicker.C:
+			{
+				tcb.SendACKPacket(util.ACK, []byte{zwp_payload[0]})
+			}
+		}
+	}
 }
 
 // Function that TIME_WAIT socket will be in

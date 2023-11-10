@@ -8,6 +8,7 @@ import (
 	"netstack/pkg/socket"
 	"netstack/pkg/util"
 	"sync"
+	"time"
 
 	"github.com/google/netstack/tcpip/header"
 )
@@ -15,20 +16,25 @@ import (
 const (
 	MAX_WND_SIZE       = 65535
 	DEFAULT_DATAOFFSET = 20
+	MAX_RTO            = 5000
+	MIN_RTO            = 100
+	RTT_ALPHA          = 0.8
+	RTT_BETA           = 1.5
+	RTT_K              = 4
+	RTT_G              = 10
 )
-
-type Segment struct {
-	Packet *TCPPacket
-	ACKed  chan bool
-	RTT    float32
-	Mu     sync.Mutex
-}
 
 type TCPPacket struct {
 	LAddr     netip.Addr
 	RAddr     netip.Addr
 	TCPHeader *header.TCPFields
 	Payload   []byte
+}
+
+type RQSegment struct {
+	Packet       *TCPPacket
+	SentAt       time.Time
+	IsRetransmit bool
 }
 
 type SendBufData struct {
@@ -57,6 +63,8 @@ type TCB struct {
 	ReapChan chan int
 	// ACK signal
 	ACKSignal chan bool
+	// Update RQ
+	RQUpdateSignal chan bool
 	// Data signal
 
 	SBufDataSignal chan SendBufData
@@ -69,8 +77,17 @@ type TCB struct {
 	RecvBuffer *socket.CircularBuffer
 	// Early Arrival Queue
 	EarlyArrivals []*TCPPacket
-	// Retransmission Queue
-	RetransmissionQ []*Segment
+
+	// --- Retransmission ---
+	RetransmissionQ []*RQSegment
+	RQMu            sync.Mutex
+	RQTicker        *time.Ticker
+	// Retransmission Timeout (in ms)
+	first     bool
+	RTO       float64
+	RTOStatus bool
+	SRTT      float64
+	// ----------------------
 
 	// Initial Sequence Numbers
 	ISS uint32
@@ -91,7 +108,8 @@ type TCB struct {
 	LBW uint32
 
 	// Zero Window Probing
-	ProbeStatus bool
+	ProbeStatus     bool
+	ProbeStopSignal chan bool
 }
 
 type SocketTableKey struct {
@@ -145,9 +163,12 @@ func (tcb *TCB) TrimSegment(tcpPacket *TCPPacket) ([]byte, uint32) {
 	SEG_LEN := uint32(len(tcpPacket.Payload))
 	SEG_DATA := tcpPacket.Payload
 	available := tcb.GetAdvertisedWND()
-
 	// Compute the offset to the first new byte
 	start := tcb.RCV_NXT - SEG_SEQ
+	if start != 0 {
+		SEG_DATA = SEG_DATA[start:]
+		SEG_LEN = uint32(len(SEG_DATA))
+	}
 	// Compute the number of bytes we can receive
 	end := min(available, SEG_LEN)
 	SEG_DATA = SEG_DATA[start:end]
@@ -155,35 +176,94 @@ func (tcb *TCB) TrimSegment(tcpPacket *TCPPacket) ([]byte, uint32) {
 	return SEG_DATA, SEG_LEN
 }
 
-// Update RTO dynamically for segments that cannot be removed
-// We DON't partially update tcp packet payload
+// Function that starts Ticker
+func (tcb *TCB) StartRTO() {
+	tcb.RQTicker = time.NewTicker(time.Duration(tcb.RTO * float64(time.Millisecond)))
+	tcb.RTOStatus = true
+}
+
+// Function that computes the RTT
+// (RFC 793)
+func (tcb *TCB) ComputeRTT(initial bool, r float64) {
+	if initial {
+		tcb.SRTT = r
+		tcb.first = false
+	} else {
+		tcb.SRTT = (RTT_ALPHA * tcb.SRTT) + ((1 - RTT_ALPHA) * r)
+	}
+	// CLAMP [100, 5000]
+	tcb.RTO = min(MAX_RTO, max(MIN_RTO, tcb.SRTT*RTT_BETA))
+}
+
 func (tcb *TCB) RQManager() {
-	// for {
-	// 	// First Wait until we get a signal that SND.UNA has been updated
-	// 	<-tcb.ACKSignal
-	// 	newRQ := make([]*Segment, 0)
-	// 	// For each segment check
-	// 	// - Complete ACK -> (SEG.SEQ + SEG.LEN - 1 < SND.UNA)
-	// 	//   - SEQ=3, LEN=3 -> (3,4,5) ok when SND.UNA >= 6
-	// 	// - Else there is data not ACK'ed yet
-	// 	for _, seg := range tcb.RetransmissionQ {
-	// 		seg_seq := seg.Packet.TCPHeader.SeqNum
-	// 		seg_len := uint32(len(seg.Packet.Payload))
-	// 		seg_lb := seg_seq + seg_len - 1
-	// 		if seg_lb < tcb.SND_UNA {
-	// 			// This segment data ALL ACK'ed
-	// 			seg.ACKed <- true
-	// 		} else {
-	// 			// The segment data is NOT FULLY ACK'ed
-	// 			// TODO: update the RTO here
-	// 			// Update Packet for RT
-	// 			seg.Packet.TCPHeader.WindowSize = uint16(tcb.GetAdvertisedWND())
-	// 			seg.Packet.TCPHeader.AckNum = tcb.RCV_NXT
-	// 			newRQ = append(newRQ, seg)
-	// 		}
-	// 	}
-	// 	tcb.RetransmissionQ = newRQ
-	// }
+	for {
+		select {
+		case <-tcb.RQUpdateSignal:
+			{
+				// Some of our in-flight bytes have been ACK'ed
+				updateTime := time.Now()
+				trimPos := 0
+				found := false
+				tcb.RQMu.Lock()
+				for i := 0; i < len(tcb.RetransmissionQ); i++ {
+					currSeg := tcb.RetransmissionQ[i]
+					currPacket := currSeg.Packet
+					currEND := currPacket.TCPHeader.SeqNum + uint32(len(currPacket.Payload)) - 1
+					if tcb.SND_UNA > currEND {
+						// Segment Fully ACK'ed
+
+						// Segment is normal (not retransmission
+						// that is a valid RTT sample
+						if !currSeg.IsRetransmit {
+							// compute and update RTT
+							diff := float64(updateTime.Sub(currSeg.SentAt).Milliseconds())
+							tcb.ComputeRTT(tcb.first, diff)
+						}
+						continue
+					} else {
+						// First Segment that is not fully ACK'ed yet
+						trimPos = i
+						found = true
+						break
+					}
+				}
+				if !found {
+					// (5.2) When all outstanding data has been ACK'ed
+					// stop the timer
+					tcb.RetransmissionQ = make([]*RQSegment, 0)
+					tcb.RQTicker.Stop()
+				} else {
+					// Trim the queue
+					// Remove all segments up until trimPos
+					tcb.RetransmissionQ = tcb.RetransmissionQ[trimPos:]
+					// (5.3) When an ACK is received that acknowledges new data, restart
+					// the RTO
+					tcb.StartRTO()
+				}
+				tcb.RQMu.Unlock()
+			}
+		case <-tcb.RQTicker.C:
+			{
+				if len(tcb.RetransmissionQ) == 0 {
+					continue
+				}
+				// (RFC 6298)
+				// (5.4) Retransmit the oldest unACK'ed segment
+				tcb.RQMu.Lock()
+				tcb.RetransmissionQ[0].IsRetransmit = true
+				tcb.RetransmissionQ[0].Packet.TCPHeader.WindowSize = uint16(tcb.GetAdvertisedWND())
+				tcb.RetransmissionQ[0].Packet.TCPHeader.AckNum = tcb.RCV_NXT
+				fmt.Println("RTO=", tcb.RTO)
+				fmt.Println("Retransmitting SEG_SEQ=", tcb.RetransmissionQ[0].Packet.TCPHeader.SeqNum-tcb.ISS, "UNA=", tcb.SND_UNA-tcb.ISS)
+				tcb.SendChan <- tcb.RetransmissionQ[0].Packet
+				tcb.RQMu.Unlock()
+				// (5.5) RTO <- 2 * RTO
+				tcb.RTO = min(MAX_RTO, 2*tcb.RTO)
+				// (5.6) Restart the Retransmission Timer
+				tcb.StartRTO()
+			}
+		}
+	}
 }
 
 // Insert so that Early Arrival Packets are in order of their sequence numbers
@@ -510,6 +590,7 @@ func CreateTCBForNormalSocket(sid int, laddr netip.Addr, lport uint16,
 		ReapChan: TCPStack.ReapChan,
 		// ACK signal
 		ACKSignal:      make(chan bool, 100),
+		RQUpdateSignal: make(chan bool, 100),
 		SBufDataSignal: make(chan SendBufData, 100),
 		SBufPutSignal:  make(chan bool, 100),
 		RBufDataSignal: make(chan bool, 100),
@@ -519,11 +600,18 @@ func CreateTCBForNormalSocket(sid int, laddr netip.Addr, lport uint16,
 		// Early Arrival Queue
 		EarlyArrivals: make([]*TCPPacket, 0),
 		// Retransmission Queue
-		RetransmissionQ: make([]*Segment, 0),
+		RetransmissionQ: make([]*RQSegment, 0),
+		first:           true,
+		RTO:             100,
+		RTOStatus:       false,
+		RQTicker:        time.NewTicker(time.Duration(MIN_RTO * float64(time.Millisecond))),
 		// Receive Window is max initially
 		RCV_WND: MAX_WND_SIZE,
 		// Last Byte Read
-		LBR: 0,
+		LBR:             0,
+		LBW:             0,
+		ProbeStatus:     false,
+		ProbeStopSignal: make(chan bool, 10),
 	}
 }
 
