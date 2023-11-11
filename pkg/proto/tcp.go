@@ -1,12 +1,12 @@
 package proto
 
 import (
-	"fmt"
 	"log/slog"
 	"net/netip"
 	"netstack/pkg/packet"
 	"netstack/pkg/socket"
 	"netstack/pkg/util"
+	"os"
 	"sync"
 	"time"
 
@@ -17,10 +17,10 @@ const (
 	MAX_WND_SIZE       = 65535
 	DEFAULT_DATAOFFSET = 20
 	// Retransmission Related
-	MAX_RTO            = 5000
-	MIN_RTO            = 100
-	RTT_ALPHA          = 0.8
-	RTT_BETA           = 1.5
+	MAX_RTO   = 5000
+	MIN_RTO   = 100
+	RTT_ALPHA = 0.8
+	RTT_BETA  = 1.5
 )
 
 type TCPPacket struct {
@@ -159,10 +159,26 @@ type TCPStackT struct {
 	SendChan chan *TCPPacket
 	// Reap Chan
 	ReapChan chan int
+	// Logger
+	Logger *slog.Logger
 }
 
 // Global Socket Table
 var TCPStack *TCPStackT
+
+// Log given string with given type
+func Log(msg string, level util.LogLevel) {
+	switch level {
+	case util.DEBUG: 
+		TCPStack.Logger.Debug(msg)
+	case util.INFO:
+		TCPStack.Logger.Info(msg)
+	case util.WARN:
+		TCPStack.Logger.Warn(msg)
+	case util.ERROR:
+		TCPStack.Logger.Error(msg)
+	}
+}
 
 // Function that initializes TCP stack
 func InitializeTCPStack(sendChan chan *TCPPacket) {
@@ -174,6 +190,11 @@ func InitializeTCPStack(sendChan chan *TCPPacket) {
 		BoundPorts:    make(map[int]bool),
 		SendChan:      sendChan,
 		ReapChan:      make(chan int, 100),
+		Logger: slog.New(util.NewPrettyHandler(os.Stdout, util.PrettyHandlerOptions{
+			SlogOpts: slog.HandlerOptions{
+				Level: slog.LevelInfo,
+			},
+		})),
 	}
 	// Start the ISN generator
 	go util.KeepIncrement(&TCPStack.ISNCTR)
@@ -433,45 +454,6 @@ func (tcb *TCB) SendACKPacket(flag uint8, data []byte) *TCPPacket {
 	return tcpPacket
 }
 
-// Helper to print out the different connection variables
-func (tcb *TCB) PrintTCBState() {
-	iss := tcb.ISS
-	irs := tcb.IRS
-	fmt.Println("----- TCB State -----")
-	fmt.Println("SND_UNA", tcb.SND_UNA-iss)
-	fmt.Println("SND_NXT", tcb.SND_NXT-iss)
-	fmt.Println("SND_WND", tcb.SND_WND)
-	fmt.Println("RCV_NXT", tcb.RCV_NXT-irs)
-	fmt.Println("RCV_WND", tcb.RCV_WND)
-	fmt.Println("LBR", tcb.LBR-irs)
-	fmt.Println("LBW", tcb.LBW-iss)
-	fmt.Println("---------------------")
-}
-
-// Helper to print out the outgoing segment
-func (tcb *TCB) PrintOutgoingSegment(seg *TCPPacket) {
-	iss := tcb.ISS
-	irs := tcb.IRS
-	fmt.Println("----- SEGMENT -----")
-	fmt.Println("SEG_SEQ", seg.TCPHeader.SeqNum-iss)
-	fmt.Println("SEG_ACK", seg.TCPHeader.AckNum-irs)
-	fmt.Println("SEG_LEN", len(seg.Payload))
-	fmt.Println("SEG_WND", seg.TCPHeader.WindowSize)
-	fmt.Println("-------------------")
-}
-
-// Helper to print out the incoming segment
-func (tcb *TCB) PrintSegment(seg *TCPPacket) {
-	iss := tcb.ISS
-	irs := tcb.IRS
-	fmt.Println("----- SEGMENT -----")
-	fmt.Println("SEG_SEQ", seg.TCPHeader.SeqNum-irs)
-	fmt.Println("SEG_ACK", seg.TCPHeader.AckNum-iss)
-	fmt.Println("SEG_LEN", len(seg.Payload))
-	fmt.Println("SEG_WND", seg.TCPHeader.WindowSize)
-	fmt.Println("-------------------")
-}
-
 // Given TCB state, check if incoming segment is valid or not
 // We do that by checking the sequence number, receiving window,
 // and segment length
@@ -557,31 +539,31 @@ func CreateTCBForListenSocket(sid int, port uint16) *TCB {
 func CreateTCBForNormalSocket(sid int, laddr netip.Addr, lport uint16,
 	raddr netip.Addr, rport uint16) *TCB {
 	return &TCB{
-		SID:          sid,
-		State:        socket.LISTEN,
-		Laddr:        laddr,
-		Lport:        lport,
-		Raddr:        raddr,
-		Rport:        rport,
-		ReceiveChan:  make(chan *TCPPacket, 100),
-		SendChan:     TCPStack.SendChan,
-		TimeReset:    make(chan bool, 100),
-		ReapChan:     TCPStack.ReapChan,
-		ACKCond:      *sync.NewCond(&sync.Mutex{}),
-		RQUpdateCond: *sync.NewCond(&sync.Mutex{}),
-		SBufDataCond:  *sync.NewCond(&sync.Mutex{}),
-		SBufPutCond:   *sync.NewCond(&sync.Mutex{}),
-		SBufEmptyCond: *sync.NewCond(&sync.Mutex{}),
-		RBufDataCond:  *sync.NewCond(&sync.Mutex{}),
-		SendBuffer: socket.InitCircularBuffer(),
-		RecvBuffer: socket.InitCircularBuffer(),
-		EarlyArrivals: make([]*TCPPacket, 0),
+		SID:             sid,
+		State:           socket.LISTEN,
+		Laddr:           laddr,
+		Lport:           lport,
+		Raddr:           raddr,
+		Rport:           rport,
+		ReceiveChan:     make(chan *TCPPacket, 100),
+		SendChan:        TCPStack.SendChan,
+		TimeReset:       make(chan bool, 100),
+		ReapChan:        TCPStack.ReapChan,
+		ACKCond:         *sync.NewCond(&sync.Mutex{}),
+		RQUpdateCond:    *sync.NewCond(&sync.Mutex{}),
+		SBufDataCond:    *sync.NewCond(&sync.Mutex{}),
+		SBufPutCond:     *sync.NewCond(&sync.Mutex{}),
+		SBufEmptyCond:   *sync.NewCond(&sync.Mutex{}),
+		RBufDataCond:    *sync.NewCond(&sync.Mutex{}),
+		SendBuffer:      socket.InitCircularBuffer(),
+		RecvBuffer:      socket.InitCircularBuffer(),
+		EarlyArrivals:   make([]*TCPPacket, 0),
 		RetransmissionQ: make([]*RQSegment, 0),
 		RQTicker:        time.NewTicker(time.Duration(MIN_RTO * float64(time.Millisecond))),
 		RTO:             100,
 		RTOStatus:       false,
 		First:           true,
-		RCV_WND: MAX_WND_SIZE,
+		RCV_WND:         MAX_WND_SIZE,
 		LBR:             0,
 		LBW:             0,
 		ProbeStatus:     false,
@@ -651,7 +633,7 @@ func CreateSocketTableKey(l bool, laddr netip.Addr, lport uint16,
 // - Compute TCP Checksum
 // - Lookup which TCB to forward the packet to
 // - Forward
-// 	 - drop the packet if look up fails
+//   - drop the packet if look up fails
 func HandleTCPProtocol(packet *packet.Packet, l *slog.Logger) {
 	// First get the payload and unmarshal
 	tcpHdr := util.ParseTCPHeader(packet.Payload)
@@ -662,7 +644,7 @@ func HandleTCPProtocol(packet *packet.Packet, l *slog.Logger) {
 	tcpHdr.Checksum = 0
 	computedChecksum := util.ComputeTCPChecksum(&tcpHdr, packet.IPHeader.Src, packet.IPHeader.Dst, payload)
 	if fromHdr != computedChecksum {
-		l.Error(fmt.Sprintf("Checksum Incorrect: Packet SEQ=%d, LEN=%d", tcpHdr.SeqNum, len(payload)))
+		l.Error("Checksum Incorrect")
 		return
 	}
 	// Construct TCP Packet

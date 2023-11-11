@@ -1,11 +1,10 @@
 package socket
 
 const (
-	MAX_WND_SIZE = 65535
+	MAX_BUF_SIZE = 65535
 )
 
 type CircularBuffer struct {
-
     // Circular Buffer used for SENDing and RECEIVing bytes
 
 	// The Buffer
@@ -19,7 +18,7 @@ type CircularBuffer struct {
 func InitCircularBuffer() *CircularBuffer {
 	return &CircularBuffer{
 		NextWrite: 0,
-		Buffer:    make([]byte, MAX_WND_SIZE),
+		Buffer:    make([]byte, MAX_BUF_SIZE),
 	}
 }
 

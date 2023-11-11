@@ -13,11 +13,16 @@ import (
 
 const (
 	// Retransmission
-	MAX_RETRANS  = 3
-	RTO_LB       = 1
-	MSL          = 5
-	MAX_SEG_SIZE = 1400 - 20 - 20
-	ZWP_TO       = 200
+	MAX_RETRANS      = 3
+	// Retransmission Timeout for Handshake
+	HANDSHAKE_RTO_LB = 1
+	// MSL for Time-Wait
+	MSL              = 5
+	// Maximum Segment Size
+	// - 1400 (Max Packet Size) - 20 (IP hdr) - 20 (TCP hdr)
+	MAX_SEG_SIZE     = 1400 - 20 - 20
+	// Zero Window Probing Initial Timeout
+	ZWP_TO           = 200
 )
 
 // Function that handles a hadnshake for PASSIVE OPEN
@@ -31,7 +36,6 @@ const (
 //   - Drop if not
 func _passiveHandshake(tcb *proto.TCB, i int) bool {
 	// Send SYN, ACK
-	// <SEQ=ISS><ACK=RCV.NXT><CTL=SYN,ACK>
 	hdr := util.CreateTCPHeader(tcb.Lport, tcb.Rport, tcb.ISS, tcb.RCV_NXT, proto.DEFAULT_DATAOFFSET, util.SYN|util.ACK, uint16(tcb.RCV_WND))
 	tcpPacket := &proto.TCPPacket{
 		LAddr:     tcb.Laddr,
@@ -41,7 +45,7 @@ func _passiveHandshake(tcb *proto.TCB, i int) bool {
 	}
 	tcb.SendChan <- tcpPacket
 	// Expontential Backoff
-	time := time.NewTimer(time.Duration((RTO_LB * i)) * time.Second)
+	time := time.NewTimer(time.Duration((HANDSHAKE_RTO_LB * i)) * time.Second)
 	for {
 		select {
 		case <-time.C:
@@ -56,11 +60,9 @@ func _passiveHandshake(tcb *proto.TCB, i int) bool {
 					return false
 				}
 
-				// 3.10.7.4
-				// First perform the Segment acceptability test
+				// Segment Acceptability Test
 				if !tcb.IsSegmentValid(reply) {
 					// If invalid send ACK in reply
-					// <SEQ=SND.NXT><ACK=RCV.NXT><CTL=ACK>
 					tcb.SendACKPacket(util.ACK, []byte{})
 					continue
 				}
@@ -114,7 +116,6 @@ func _passiveHandshake(tcb *proto.TCB, i int) bool {
 //   - This is a CLOSE on SYN_SENT state
 func _activeHandShake(tcb *proto.TCB, i int) bool {
 	// Send SYN
-	// <SEQ=ISS><CTL=SYN>
 	hdr := util.CreateTCPHeader(tcb.Lport, tcb.Rport, tcb.ISS, 0, proto.DEFAULT_DATAOFFSET, util.SYN, uint16(tcb.RCV_WND))
 	tcpPacket := &proto.TCPPacket{
 		LAddr:     tcb.Laddr,
@@ -124,7 +125,7 @@ func _activeHandShake(tcb *proto.TCB, i int) bool {
 	}
 	tcb.SendChan <- tcpPacket
 	// Expontential Backoff
-	time := time.NewTimer(time.Duration(RTO_LB*i) * time.Second)
+	time := time.NewTimer(time.Duration(HANDSHAKE_RTO_LB*i) * time.Second)
 	for {
 		select {
 		case <-time.C:
@@ -170,8 +171,6 @@ func _activeHandShake(tcb *proto.TCB, i int) bool {
 
 				// Set window variables
 				tcb.SND_WND = uint32(tcpPacket.TCPHeader.WindowSize)
-				// Send ACK for SYN, ACK
-				// <SEQ=SND.NXT><ACK=RCV.NXT><CTL=ACK>
 				tcb.SendACKPacket(util.ACK, []byte{})
 				// Handshake is complete
 				return true
@@ -182,6 +181,9 @@ func _activeHandShake(tcb *proto.TCB, i int) bool {
 
 // Function that sends out data in the send buffer
 // Blocks if there is no data to send out
+// Once it un-blocks, it will try to send out all the data
+// in the send buffer. Add to retransmission queue in case of
+// retransmission
 func _doMonitorSendBuffer(tcb *proto.TCB) {
 	for {
 		// Wait for the signal
@@ -208,7 +210,6 @@ func _doMonitorSendBuffer(tcb *proto.TCB) {
 			tcb.SendBuffer.Get(buf)
 			// Send the packet out
 			tcpPacket := tcb.SendACKPacket(util.ACK, buf)
-			// fmt.Println("Sending SEQ=", tcpPacket.TCPHeader.SeqNum-tcb.ISS, "WND=", sndWNDSZ, "UNA=", tcb.SND_UNA-tcb.ISS)
 			// Update SND_NXT
 			tcb.SND_NXT += uint32(can_send)
 			bytesToSend -= can_send
@@ -234,10 +235,13 @@ func _doMonitorSendBuffer(tcb *proto.TCB) {
 }
 
 // Funciton that manages the retransmission queue
+// If we get a signal that UNA has been updated, we loop through
+// the RQ and remove segments that no longer needed to be retransmitted
 func _doManageRQ(tcb *proto.TCB) {
 	for {
 		tcb.RQUpdateCond.L.Lock()
 		tcb.RQUpdateCond.Wait()
+
 		// Some of our in-flight bytes have been ACK'ed
 		updateTime := time.Now()
 		trimPos := 0
@@ -280,10 +284,9 @@ func _doManageRQ(tcb *proto.TCB) {
 	}
 }
 
-// Function that keeps retransmitting the oldest packet
+// Function that keeps retransmitting the oldest packet every RTO 
 func _doRetransmit(tcb *proto.TCB) {
 	for {
-
 		select {
 		case <-tcb.RQTicker.C:
 			{
@@ -297,7 +300,10 @@ func _doRetransmit(tcb *proto.TCB) {
 				tcb.RetransmissionQ[0].Packet.TCPHeader.WindowSize = uint16(tcb.GetAdvertisedWND())
 				tcb.RetransmissionQ[0].Packet.TCPHeader.AckNum = tcb.RCV_NXT
 				tcb.RetransmissionQ[0].Packet.TCPHeader.Checksum = 0
-				fmt.Println("Retransmitting SEG_SEQ=", tcb.RetransmissionQ[0].Packet.TCPHeader.SeqNum-tcb.ISS, "UNA=", tcb.SND_UNA-tcb.ISS, "RTO=", tcb.RTO)
+				proto.Log(
+					fmt.Sprintf("Retransmitting SEG_SEQ=%d, UNA=%d, RTO=%f",
+						tcb.RetransmissionQ[0].Packet.TCPHeader.SeqNum-tcb.ISS,
+						tcb.SND_UNA-tcb.ISS, tcb.RTO), util.INFO)
 				tcb.SendChan <- tcb.RetransmissionQ[0].Packet
 				tcb.RQMu.Unlock()
 				// (5.5) RTO <- 2 * RTO
@@ -310,7 +316,7 @@ func _doRetransmit(tcb *proto.TCB) {
 }
 
 // Function that puts data to buffer
-// Blocks until send buffer has space
+// Blocks until all data are put into send buffer
 func _doSend(tcb *proto.TCB, data []byte) {
 	// First get the usable space in the send buffer
 	remain := uint16(len(data))
@@ -343,8 +349,14 @@ func _doSend(tcb *proto.TCB, data []byte) {
 	}
 }
 
-// Function that do things socket is meant to do
-// When entering this state, socket is in ESTABLISHED state
+// Function that handles ACK segments after socket goes into ESTABLISHED state
+// Specifically 
+// - Check if segment acceptable or not
+// - Check if the segment is early arrival or not
+// - Check data and trim to fit into receive window
+// - Check early arrival queue and merge packets if possible
+// - Check ACK bit
+// - Check FIN bit
 func _doHandleSegment(tcb *proto.TCB) {
 	for {
 		select {
@@ -379,7 +391,7 @@ func _doHandleSegment(tcb *proto.TCB) {
 					SEG_DATA, SEG_LEN = tcb.TrimSegment(tcpPacket)
 				}
 
-				// ---- MERGE EA (if possible) ----
+				// ---- MERGE EA  ----
 				if len(tcb.EarlyArrivals) != 0 {
 					SEG_DATA, SEG_LEN = tcb.MergeEAQ(tcb.RCV_NXT+uint32(SEG_LEN), SEG_DATA)
 				}
@@ -535,7 +547,8 @@ func _handleAckSeg(tcb *proto.TCB, tcpPacket *proto.TCPPacket) (bool, bool) {
 	} else if SEG_ACK > tcb.SND_NXT {
 		// ACK for unsent stuff (ACK and drop)
 		tcb.SendACKPacket(util.ACK, []byte{})
-		fmt.Println("Unseen ACK", "SEG_ACK=", SEG_ACK-tcb.ISS, "SND_NXT=", tcb.SND_NXT-tcb.ISS)
+		proto.Log(fmt.Sprintf("Unseen ACK: SEG_ACK=%d, SND_NXT=%d",
+			SEG_ACK-tcb.ISS, tcb.SND_NXT-tcb.ISS), util.INFO)
 		return false, false
 	}
 
@@ -586,13 +599,16 @@ func _handleAckSeg(tcb *proto.TCB, tcpPacket *proto.TCPPacket) (bool, bool) {
 }
 
 // Function that does zero window probing
+// - If sent to ProbeStopSignal, return
+// - Every ZWP_TO, send out probe packet
+//   - ZWP_TO is computed using exponential backoff
 func _doZWP(tcb *proto.TCB) {
 	// If Send Buffer is empty, then we can return
 	if tcb.GetNumFreeBytesInSNDBUF() == proto.MAX_WND_SIZE {
 		return
 	}
 
-	fmt.Println("Start ZWP")
+	proto.Log("Starting Zero Window Probing", util.INFO)
 
 	// Else stop the RTO
 	tcb.RQTicker.Stop()
@@ -610,7 +626,7 @@ func _doZWP(tcb *proto.TCB) {
 		select {
 		case <-tcb.ProbeStopSignal:
 			{
-				fmt.Println("End ZWP")
+				proto.Log("Ending Zero Window Probing", util.INFO)
 				return
 			}
 		case <-zwpTicker.C:
@@ -657,8 +673,9 @@ reset:
 // Active Close
 // Send a FIN packet to other side to let them know that
 // you are done sending data and ready to close the connection
+// You will only send the FIN packet when the SendBuffer is empty
 func _doActiveClose(tcb *proto.TCB) {
-	// Wait until we are good to go
+	// Wait until SendBuffer is empty
 	U := tcb.GetNumBytesInSNDBUF()
 	tcb.SBufEmptyCond.L.Lock()
 	for U != 0 {
@@ -692,6 +709,11 @@ func _doActiveClose(tcb *proto.TCB) {
 }
 
 // Function that sends a file given by "filepath"
+// - open the file
+// - while there is bytes in file
+//   - read MAX_WND_SIZE bytes from the file
+//   - invoke VWRITE
+// - invoke VClose to initiate connection teardown
 func SendFile(tcb *proto.TCB, filepath string, l *slog.Logger) {
 	// Get the handle
 	f, err := os.Open(filepath)
@@ -730,6 +752,11 @@ func SendFile(tcb *proto.TCB, filepath string, l *slog.Logger) {
 }
 
 // Function that receives a file
+// - open the file
+// - while not EOF
+//   - invoke VRead to receive bytes
+//   - write to the opened file
+// - invoke VClose to end the connection
 func ReceiveFile(tcb *proto.TCB, dest string, l *slog.Logger) {
 	// Get the handle
 	f, err := os.Create(dest)

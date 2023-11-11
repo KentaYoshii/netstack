@@ -20,6 +20,17 @@ type PrettyHandler struct {
     L *log.Logger
 }
 
+type LogLevel int
+
+const (
+    // Different enums for log levels
+    
+    DEBUG LogLevel = iota
+    INFO
+    WARN 
+    ERROR
+)   
+
 func (h *PrettyHandler) Handle(ctx context.Context, r slog.Record) error {
     level := r.Level.String() + ":"
 
