@@ -245,9 +245,15 @@ func (r *Repl) handleSocketSend(args []string) string {
 func (r *Repl) handleSocketReceive(args []string) string {
 	var b strings.Builder
 
-	if len(args) != 3 {
-		r.HostInfo.Logger.Error("Usage: r <sid> <numbytes>")
+	if len(args) < 3 {
+		r.HostInfo.Logger.Error("Usage: r <sid> <numbytes> [-s]")
 		return ""
+	}
+
+	var sup bool = false
+
+	if len(args) == 4 && args[3] == "-s" {
+		sup = true
 	}
 
 	sid, err := strconv.Atoi(args[1])
@@ -281,6 +287,11 @@ func (r *Repl) handleSocketReceive(args []string) string {
 	if err != nil {
 		r.HostInfo.Logger.Error(err.Error())
 		return ""
+	}
+
+	// Suppress
+	if sup {
+		return b.String()
 	}
 
 	r.HostInfo.Logger.Info(fmt.Sprintf("%d bytes read from SID=%d, content=%s",

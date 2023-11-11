@@ -97,8 +97,9 @@ func (li *VTCPListener) VAccept(tcbChan chan *proto.TCB) {
 				li.InfoChan <- fmt.Sprintf("New connection on SID=%d => Created new socket with SID=%d", li.TCB.SID, newTCB.SID)
 				// 5
 				go _doSocket(newTCB)
+				go _doRetransmit(newTCB)
+				go _doManageRQ(newTCB)
 				go monitorSendBuffer(newTCB)
-				go newTCB.RQManager()
 				tcbChan <- newTCB
 				break
 			}
@@ -153,8 +154,9 @@ retry:
 			// SYN was ACK'ed
 			// Dispatch this socket
 			go _doSocket(tcb)
+			go _doRetransmit(tcb)
+			go _doManageRQ(tcb)
 			go monitorSendBuffer(tcb)
-			go tcb.RQManager()
 			// Return the conn
 			return &VTCPConn{
 				TCB: tcb,
@@ -192,30 +194,33 @@ func VRead(tcb *proto.TCB, buf []byte) (int, error) {
 	}
 
 	// BLOCK when there is data to read
-
+	var unreadB = tcb.GetUnreadBytes()
 	// First check the recv buffer
+	tcb.RBufDataCond.L.Lock()
 	for {
 		// Data is available
 		// Two cases:
 		// - normal data is available
 		// - other side done sending
 		if tcb.State == socket.CLOSE_WAIT &&
-			(tcb.GetUnreadBytes())-1 == 0 {
+			(unreadB)-1 == 0 {
 			return 0, errors.New("EOF")
 		}
-		if tcb.GetUnreadBytes() == 0 {
+		if unreadB == 0 {
 			// Block until signaled
-			<-tcb.RBufDataSignal
+			tcb.RBufDataCond.Wait()
 		} else {
 			break
 		}
+		unreadB = tcb.GetUnreadBytes()
 	}
+	tcb.RBufDataCond.L.Unlock()
 	// Then read the data that was put
 	// If user wants to read 5 bytes but only 3 bytes
 	// were put, read that 3 bytes
-	toReadBytes := min(len(buf), int(tcb.GetUnreadBytes()))
+	toReadBytes := min(len(buf), int(unreadB))
 	if tcb.State == socket.CLOSE_WAIT &&
-		toReadBytes == int(tcb.GetUnreadBytes()) {
+		toReadBytes == int(unreadB) {
 		toReadBytes -= 1
 	}
 	tcb.RecvBuffer.Get(buf[:toReadBytes])

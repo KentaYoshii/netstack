@@ -74,11 +74,6 @@ func (cb *CircularBuffer) Put(data []byte) {
 	}
 }
 
-// Peek the first byte for ZWP
-func (cb *CircularBuffer) Peek(buf [1]byte) {
-	buf[0] = cb.Buffer[cb.NextRead]
-}
-
 // Function that extracts the data out of the buffer.
 // Assumption is that the caller of this function is ready to read "data"
 func (cb *CircularBuffer) Get(buf []byte) {
