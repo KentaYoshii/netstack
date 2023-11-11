@@ -242,19 +242,8 @@ func VWrite(tcb *proto.TCB, data []byte) (int, error) {
 		return 0, errors.New("error: connection closing")
 	}
 
-	totalSize := len(data)
-	bytesWritten := 0
-	for totalSize > 0 {
-		// First get the current segment
-		currSEGLEN := min(totalSize, MAX_SEG_SIZE)
-		// Send
-		// - This subr blocks until segment is in the send buffer
-		_doSend(tcb, data[bytesWritten:bytesWritten+currSEGLEN])
-		totalSize -= currSEGLEN
-		bytesWritten += currSEGLEN
-	}
-
-	return bytesWritten, nil
+	_doSend(tcb, data)
+	return len(data), nil
 }
 
 // Initiates the connection termination process for this socket

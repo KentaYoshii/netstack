@@ -185,11 +185,12 @@ func _activeHandShake(tcb *proto.TCB, i int) bool {
 func monitorSendBuffer(tcb *proto.TCB) {
 	for {
 		// Wait for the signal
-		d := <-tcb.SBufDataSignal
+		tcb.SBufDataCond.L.Lock()
+		tcb.SBufDataCond.Wait()
 		// Get the unsent bytes
 		bytesToSend := tcb.GetNumBytesInSNDBUF()
 		// While we have bytes to send out or FIN bit is set
-		for bytesToSend > 0 || (d.Flag&util.FIN) != 0 {
+		for bytesToSend > 0 {
 			// Then check if we have space in snd wnd
 			sndWNDSZ := tcb.GetNumBytesInSNDWND()
 			tcb.ACKCond.L.Lock()
@@ -202,20 +203,15 @@ func monitorSendBuffer(tcb *proto.TCB) {
 			tcb.ACKCond.L.Unlock()
 			// We can send the entire bytesToSend or whatever we can fit into send window
 			can_send := min(bytesToSend, sndWNDSZ, MAX_SEG_SIZE)
-			fmt.Println(fmt.Sprintf("Sending %d bytes starting at %d! SND_WND is %d", can_send, tcb.SND_NXT-tcb.ISS, sndWNDSZ))
 			buf := make([]byte, can_send)
 			// Get the bytes
 			tcb.SendBuffer.Get(buf)
 			// Send the packet out
-			tcpPacket := tcb.SendACKPacket(d.Flag, buf)
+			tcpPacket := tcb.SendACKPacket(util.ACK, buf)
+			// fmt.Println("Sending SEQ=", tcpPacket.TCPHeader.SeqNum-tcb.ISS, "WND=", sndWNDSZ, "UNA=", tcb.SND_UNA-tcb.ISS)
 			// Update SND_NXT
-			tcb.SND_NXT += can_send
+			tcb.SND_NXT += uint32(can_send)
 			bytesToSend -= can_send
-
-			if d.Flag&util.FIN != 0 {
-				// If it is FIN then advance one more
-				tcb.SND_NXT = tcb.SND_NXT + 1
-			}
 
 			// Add to RQ and start the retransmissoin clock
 			// - RTT sample can only be taken for normal packet
@@ -228,21 +224,20 @@ func monitorSendBuffer(tcb *proto.TCB) {
 			tcb.RQMu.Unlock()
 			if !tcb.RTOStatus {
 				// If timer is not running, start
-				tcb.StartRTO()
-			}
-
-			if d.Flag&util.FIN != 0 {
-				break
+				tcb.RQTicker.Reset(tcb.GetRTO())
 			}
 		}
+		// Emptied!
+		tcb.SBufEmptyCond.Signal()
+		tcb.SBufDataCond.L.Unlock()
 	}
 }
 
 // Funciton that manages the retransmission queue
 func _doManageRQ(tcb *proto.TCB) {
 	for {
-		tcb.RBufDataCond.L.Lock()
-		tcb.RBufDataCond.Wait()
+		tcb.RQUpdateCond.L.Lock()
+		tcb.RQUpdateCond.Wait()
 		// Some of our in-flight bytes have been ACK'ed
 		updateTime := time.Now()
 		trimPos := 0
@@ -279,35 +274,38 @@ func _doManageRQ(tcb *proto.TCB) {
 			// Trim the queue
 			// Remove all segments up until trimPos
 			tcb.RetransmissionQ = tcb.RetransmissionQ[trimPos:]
-			// (5.3) When an ACK is received that acknowledges new data, restart
-			// the RTO
-			tcb.StartRTO()
 		}
 		tcb.RQMu.Unlock()
-		tcb.RBufDataCond.L.Unlock()
+		tcb.RQUpdateCond.L.Unlock()
 	}
 }
 
 // Function that keeps retransmitting the oldest packet
 func _doRetransmit(tcb *proto.TCB) {
-	for range tcb.RQTicker.C {
-		if len(tcb.RetransmissionQ) == 0 {
-			continue
+	for {
+
+		select {
+		case <-tcb.RQTicker.C:
+			{
+				if len(tcb.RetransmissionQ) == 0 {
+					continue
+				}
+				// (RFC 6298)
+				// (5.4) Retransmit the oldest unACK'ed segment
+				tcb.RQMu.Lock()
+				tcb.RetransmissionQ[0].IsRetransmit = true
+				tcb.RetransmissionQ[0].Packet.TCPHeader.WindowSize = uint16(tcb.GetAdvertisedWND())
+				tcb.RetransmissionQ[0].Packet.TCPHeader.AckNum = tcb.RCV_NXT
+				tcb.RetransmissionQ[0].Packet.TCPHeader.Checksum = 0
+				fmt.Println("Retransmitting SEG_SEQ=", tcb.RetransmissionQ[0].Packet.TCPHeader.SeqNum-tcb.ISS, "UNA=", tcb.SND_UNA-tcb.ISS, "RTO=", tcb.RTO)
+				tcb.SendChan <- tcb.RetransmissionQ[0].Packet
+				tcb.RQMu.Unlock()
+				// (5.5) RTO <- 2 * RTO
+				tcb.RTO = min(proto.MAX_RTO, 2*tcb.RTO)
+				// (5.6) Restart the Retransmission Timer
+				tcb.RQTicker.Reset(tcb.GetRTO())
+			}
 		}
-		// (RFC 6298)
-		// (5.4) Retransmit the oldest unACK'ed segment
-		tcb.RQMu.Lock()
-		tcb.RetransmissionQ[0].IsRetransmit = true
-		tcb.RetransmissionQ[0].Packet.TCPHeader.WindowSize = uint16(tcb.GetAdvertisedWND())
-		tcb.RetransmissionQ[0].Packet.TCPHeader.AckNum = tcb.RCV_NXT
-		tcb.RetransmissionQ[0].Packet.TCPHeader.Checksum = 0
-		fmt.Println("Retransmitting SEG_SEQ=", tcb.RetransmissionQ[0].Packet.TCPHeader.SeqNum-tcb.ISS, "UNA=", tcb.SND_UNA-tcb.ISS, "RTO=", tcb.RTO)
-		tcb.SendChan <- tcb.RetransmissionQ[0].Packet
-		tcb.RQMu.Unlock()
-		// (5.5) RTO <- 2 * RTO
-		tcb.RTO = min(proto.MAX_RTO, 2*tcb.RTO)
-		// (5.6) Restart the Retransmission Timer
-		tcb.StartRTO()
 	}
 }
 
@@ -315,10 +313,10 @@ func _doRetransmit(tcb *proto.TCB) {
 // Blocks until send buffer has space
 func _doSend(tcb *proto.TCB, data []byte) {
 	// First get the usable space in the send buffer
-	U := tcb.GetNumFreeBytesInSNDBUF()
-	remain := uint32(len(data))
+	remain := uint16(len(data))
 	off := 0
 	for remain > 0 {
+		U := tcb.GetNumFreeBytesInSNDBUF()
 		// While we have data to put
 		tcb.SBufPutCond.L.Lock()
 		for U == 0 {
@@ -333,15 +331,15 @@ func _doSend(tcb *proto.TCB, data []byte) {
 		// Put
 		tcb.SendBuffer.Put(data[off : off+int(canPut)])
 		// Update LBW
-		tcb.LBW += canPut
+		tcb.LBW += uint32(canPut)
 		// Decrement D
 		remain -= canPut
 		// Update offset
 		off += int(canPut)
-		// Signal the monitoror about the new data
-		tcb.SBufDataSignal <- proto.SendBufData{
-			Flag: util.ACK,
-		}
+		// Signal the sender about the new data
+		tcb.SBufDataCond.L.Lock()
+		tcb.SBufDataCond.Signal()
+		tcb.SBufDataCond.L.Unlock()
 	}
 }
 
@@ -366,7 +364,7 @@ func _doSocket(tcb *proto.TCB) {
 
 				SEG_SEQ := tcpPacket.TCPHeader.SeqNum
 				SEG_ACK := tcpPacket.TCPHeader.AckNum
-				SEG_LEN := uint32(len(tcpPacket.Payload))
+				SEG_LEN := uint16(len(tcpPacket.Payload))
 				SEG_DATA := tcpPacket.Payload
 				SEG_FLAG := tcpPacket.TCPHeader.Flags
 
@@ -384,7 +382,7 @@ func _doSocket(tcb *proto.TCB) {
 
 				// ---- MERGE EA (if possible) ----
 				if len(tcb.EarlyArrivals) != 0 {
-					SEG_DATA, SEG_LEN = tcb.MergeEAQ(tcb.RCV_NXT+SEG_LEN, SEG_DATA)
+					SEG_DATA, SEG_LEN = tcb.MergeEAQ(tcb.RCV_NXT+uint32(SEG_LEN), SEG_DATA)
 				}
 
 				// ---- ACK ----
@@ -420,13 +418,13 @@ func _doSocket(tcb *proto.TCB) {
 // Here we know that whatever in SEG_DATA, we can receive them in full
 // Additionally, segment should be "idealized segment"
 // RCV.NXT == SEG_SEQ && SEG_LEN < RCV_WND_SZ
-func _handleTextSeg(tcb *proto.TCB, data []byte, dlen uint32) {
+func _handleTextSeg(tcb *proto.TCB, data []byte, dlen uint16) {
 	switch tcb.State {
 	case socket.ESTABLISHED, socket.FIN_WAIT_1, socket.FIN_WAIT_2:
 		// Put the data
 		tcb.RecvBuffer.Put(data)
 		// Increment RCV_NXT over the received data
-		tcb.RCV_NXT += dlen
+		tcb.RCV_NXT += uint32(dlen)
 		// Send ACK for everything up until here
 		tcb.SendACKPacket(util.ACK, []byte{})
 		// Signal the reader
@@ -519,7 +517,7 @@ func _handleAckSeg(tcb *proto.TCB, tcpPacket *proto.TCPPacket) (bool, bool) {
 		// (5.3) When an ACK is received that acknowledges
 		// new data, restart the retransmission timer so
 		// that it will expire after RTO seconds
-		tcb.StartRTO()
+		tcb.RQTicker.Reset(tcb.GetRTO())
 		// Signal the update to the manager
 		tcb.RQUpdateCond.Signal()
 		// Signal the new space in send buffer
@@ -533,7 +531,7 @@ func _handleAckSeg(tcb *proto.TCB, tcpPacket *proto.TCPPacket) (bool, bool) {
 		if (tcb.SND_UNA == SEG_ACK) &&
 			(SEG_LEN == 0) &&
 			(tcb.SND_UNA != tcb.SND_NXT) {
-			fmt.Println("Duplicate ACK", "SEG_ACK=", SEG_ACK-tcb.ISS)
+			// fmt.Println("Duplicate ACK", "SEG_ACK=", SEG_ACK-tcb.ISS)
 		}
 	} else if SEG_ACK > tcb.SND_NXT {
 		// ACK for unsent stuff (ACK and drop)
@@ -550,7 +548,6 @@ func _handleAckSeg(tcb *proto.TCB, tcpPacket *proto.TCPPacket) (bool, bool) {
 		if SEG_WND == 0 && !tcb.ProbeStatus {
 			tcb.ProbeStatus = true
 			go _doZWP(tcb)
-			fmt.Println("Start ZWP")
 		} else if prevWND != tcb.SND_WND {
 			tcb.ACKCond.Signal()
 		}
@@ -606,6 +603,8 @@ func _doZWP(tcb *proto.TCB) {
 		return
 	}
 
+	fmt.Println("Start ZWP")
+
 	// Else stop the RTO
 	tcb.RQTicker.Stop()
 
@@ -622,8 +621,7 @@ func _doZWP(tcb *proto.TCB) {
 		select {
 		case <-tcb.ProbeStopSignal:
 			{
-				// Restart the timer
-				tcb.StartRTO()
+				fmt.Println("End ZWP")
 				return
 			}
 		case <-zwpTicker.C:
@@ -671,6 +669,15 @@ reset:
 // Send a FIN packet to other side to let them know that
 // you are done sending data and ready to close the connection
 func _doActiveClose(tcb *proto.TCB) {
+	// Wait until we are good to go
+	U := tcb.GetNumBytesInSNDBUF()
+	tcb.SBufEmptyCond.L.Lock()
+	for U != 0 {
+		tcb.SBufEmptyCond.Wait()
+		U = tcb.GetNumBytesInSNDBUF()
+	}
+	tcb.SBufEmptyCond.L.Unlock()
+	// Update State
 	if tcb.State == socket.CLOSE_WAIT {
 		// The other side initiated the CLOSE
 		tcb.State = socket.LAST_ACK
@@ -679,8 +686,19 @@ func _doActiveClose(tcb *proto.TCB) {
 		tcb.State = socket.FIN_WAIT_1
 	}
 	// Send FIN
-	tcb.SBufDataSignal <- proto.SendBufData{
-		Flag: util.ACK | util.FIN,
+	finPacket := tcb.SendACKPacket(util.ACK|util.FIN, []byte{})
+	// update SND_NXT
+	tcb.SND_NXT += 1
+	tcb.RQMu.Lock()
+	tcb.RetransmissionQ = append(tcb.RetransmissionQ, &proto.RQSegment{
+		Packet:       finPacket,
+		SentAt:       time.Now(),
+		IsRetransmit: false,
+	})
+	tcb.RQMu.Unlock()
+	if !tcb.RTOStatus {
+		// If timer is not running, start
+		tcb.RQTicker.Reset(tcb.GetRTO())
 	}
 }
 
@@ -719,10 +737,7 @@ func SendFile(tcb *proto.TCB, filepath string, l *slog.Logger) {
 		}
 	}
 	// Close the connection to let the other side know we are done sending
-	err = VClose(tcb)
-	if err != nil {
-		l.Error(err.Error())
-	}
+	go VClose(tcb)
 }
 
 // Function that receives a file
@@ -762,8 +777,5 @@ func ReceiveFile(tcb *proto.TCB, dest string, l *slog.Logger) {
 		}
 	}
 	// Close the connection
-	err = VClose(tcb)
-	if err != nil {
-		l.Error(err.Error())
-	}
+	go VClose(tcb)
 }

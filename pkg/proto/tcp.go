@@ -66,10 +66,11 @@ type TCB struct {
 	RQUpdateCond sync.Cond
 
 	// Data signal
-	SBufDataSignal chan SendBufData
 
-	SBufPutCond  sync.Cond
-	RBufDataCond sync.Cond
+	SBufDataCond  sync.Cond
+	SBufPutCond   sync.Cond
+	SBufEmptyCond sync.Cond
+	RBufDataCond  sync.Cond
 
 	// Pointers to Buffers
 	SendBuffer *socket.CircularBuffer
@@ -157,28 +158,28 @@ func InitializeTCPStack(sendChan chan *TCPPacket) {
 }
 
 // =================== Helper ===================
-func (tcb *TCB) TrimSegment(tcpPacket *TCPPacket) ([]byte, uint32) {
+func (tcb *TCB) TrimSegment(tcpPacket *TCPPacket) ([]byte, uint16) {
 	SEG_SEQ := tcpPacket.TCPHeader.SeqNum
-	SEG_LEN := uint32(len(tcpPacket.Payload))
+	SEG_LEN := uint16(len(tcpPacket.Payload))
 	SEG_DATA := tcpPacket.Payload
 	available := tcb.GetAdvertisedWND()
 	// Compute the offset to the first new byte
 	start := tcb.RCV_NXT - SEG_SEQ
 	if start != 0 {
 		SEG_DATA = SEG_DATA[start:]
-		SEG_LEN = uint32(len(SEG_DATA))
+		SEG_LEN = uint16(len(SEG_DATA))
 	}
 	// Compute the number of bytes we can receive
 	end := min(available, SEG_LEN)
 	SEG_DATA = SEG_DATA[start:end]
-	SEG_LEN = uint32(len(SEG_DATA))
+	SEG_LEN = uint16(len(SEG_DATA))
 	return SEG_DATA, SEG_LEN
 }
 
 // Function that starts Ticker
-func (tcb *TCB) StartRTO() {
-	tcb.RQTicker = time.NewTicker(time.Duration(tcb.RTO * float64(time.Millisecond)))
+func (tcb *TCB) GetRTO() time.Duration {
 	tcb.RTOStatus = true
+	return time.Duration(tcb.RTO * float64(time.Millisecond))
 }
 
 // Function that computes the RTT
@@ -241,11 +242,11 @@ func (tcb *TCB) InsertEAQ(packet *TCPPacket) bool {
 
 // Given end sequence number (incl.) of current segment data
 // Loop the EAQ and merge data
-func (tcb *TCB) MergeEAQ(start uint32, currData []byte) ([]byte, uint32) {
-	available := tcb.GetAdvertisedWND() - uint32(len(currData))
+func (tcb *TCB) MergeEAQ(start uint32, currData []byte) ([]byte, uint16) {
+	available := tcb.GetAdvertisedWND() - uint16(len(currData))
 	if available == 0 {
 		// No space available in recv buf
-		return currData, uint32(len(currData))
+		return currData, uint16(len(currData))
 	}
 	for i, curr := range tcb.EarlyArrivals {
 		currSEQ := curr.TCPHeader.SeqNum
@@ -258,7 +259,7 @@ func (tcb *TCB) MergeEAQ(start uint32, currData []byte) ([]byte, uint32) {
 			// not contiguous -> cannot receive
 			// - remove all the preceding segments
 			tcb.EarlyArrivals = tcb.EarlyArrivals[i:]
-			return currData, uint32(len(currData))
+			return currData, uint16(len(currData))
 		}
 
 		// Either
@@ -272,7 +273,7 @@ func (tcb *TCB) MergeEAQ(start uint32, currData []byte) ([]byte, uint32) {
 		// Append the data
 		currData = append(currData, d[:mLen]...)
 		// Reflect the update
-		available -= uint32(mLen)
+		available -= uint16(mLen)
 		// Update pointer to next byte to be merge
 		start += uint32(mLen)
 		// Check if we can merge more
@@ -294,34 +295,34 @@ func (tcb *TCB) MergeEAQ(start uint32, currData []byte) ([]byte, uint32) {
 			} else {
 				tcb.EarlyArrivals = tcb.EarlyArrivals[i+1:]
 			}
-			return currData, uint32(len(currData))
+			return currData, uint16(len(currData))
 		}
 
 		// Partial merge
 		// -> rm up until and excluding this segment from the queue
 		tcb.EarlyArrivals = tcb.EarlyArrivals[i:]
-		return currData, uint32(len(currData))
+		return currData, uint16(len(currData))
 	}
 
 	// If we get here we have merged everything and available > 0
 	tcb.EarlyArrivals = make([]*TCPPacket, 0)
-	return currData, uint32(len(currData))
+	return currData, uint16(len(currData))
 }
 
 // Get the useable window given a TCB state
-func (tcb *TCB) GetNumBytesInSNDWND() uint32 {
-	return tcb.SND_UNA + tcb.SND_WND - tcb.SND_NXT
+func (tcb *TCB) GetNumBytesInSNDWND() uint16 {
+	return uint16(tcb.SND_UNA + tcb.SND_WND - tcb.SND_NXT)
 }
 
 // Gets the number of free bytes in the send buffer
 //
 //	n         l
 //
-// [f f f f + + + + + +]
+// [+ + + + + + f f f f]
 // lbw = 9, snd_nx = 4 so 9 - 4 + 1 = 6 unsent bytes
 // 10 - 6 = 4 bytes that we can overwrite
-func (tcb *TCB) GetNumFreeBytesInSNDBUF() uint32 {
-	return MAX_WND_SIZE - (tcb.LBW - tcb.SND_NXT + 1)
+func (tcb *TCB) GetNumFreeBytesInSNDBUF() uint16 {
+	return uint16(MAX_WND_SIZE - (tcb.LBW - tcb.SND_NXT + 1))
 }
 
 // Gets the number of unsent bytes in the send buffer
@@ -329,8 +330,8 @@ func (tcb *TCB) GetNumFreeBytesInSNDBUF() uint32 {
 //	n       l
 //
 // [* * * * * f f f]
-func (tcb *TCB) GetNumBytesInSNDBUF() uint32 {
-	return tcb.LBW - tcb.SND_NXT + 1
+func (tcb *TCB) GetNumBytesInSNDBUF() uint16 {
+	return uint16(tcb.LBW - tcb.SND_NXT + 1)
 }
 
 // Get the advertised window given a TCB state
@@ -352,13 +353,13 @@ func (tcb *TCB) GetNumBytesInSNDBUF() uint32 {
 // l                     n
 // [ * * * * * * * * * * ]
 // 10 - (10 - 1 - (-1)) = 0
-func (tcb *TCB) GetAdvertisedWND() uint32 {
-	return MAX_WND_SIZE - ((tcb.RCV_NXT - 1) - tcb.LBR)
+func (tcb *TCB) GetAdvertisedWND() uint16 {
+	return uint16(MAX_WND_SIZE - ((tcb.RCV_NXT - 1) - tcb.LBR))
 }
 
 // Gets the number of unread bytes in the recv buffer
-func (tcb *TCB) GetUnreadBytes() uint32 {
-	return (tcb.RCV_NXT - 1) - tcb.LBR
+func (tcb *TCB) GetUnreadBytes() uint16 {
+	return uint16((tcb.RCV_NXT - 1) - tcb.LBR)
 }
 
 // Send is done if retransmission queue is empty
@@ -439,13 +440,13 @@ func (tcb *TCB) IsSegmentValid(tcpPacket *TCPPacket) bool {
 	// Case 1: SEG_LEN = 0 && RECV_WND = 0
 	// -> SEG_SEQ = RCV_NXT
 	if SEG_LEN == 0 && RCV_WND == 0 {
-		return SEG_SEQ == RCV_WND
+		return SEG_SEQ == uint32(RCV_WND)
 	}
 
 	// Case 2: SEG_LEN = 0 && RECV_WND > 0
 	// -> RCV.NXT <= SEG.SEQ <= RCV.NXT+RCV.WND
 	if SEG_LEN == 0 && RCV_WND > 0 {
-		return (tcb.RCV_NXT <= SEG_SEQ) && (SEG_SEQ <= tcb.RCV_NXT+RCV_WND)
+		return (tcb.RCV_NXT <= SEG_SEQ) && (SEG_SEQ <= tcb.RCV_NXT+uint32(RCV_WND))
 	}
 
 	// Case 3: SEG_LEN > 0 && RECV_WND = 0
@@ -460,9 +461,9 @@ func (tcb *TCB) IsSegmentValid(tcpPacket *TCPPacket) bool {
 	// -> RCV.NXT <= SEG.SEQ+SEG_LEN-1 < RCV.NXT+RCV.WND
 
 	// Does first part of the segment fall within the window
-	cond1 := (tcb.RCV_NXT <= SEG_SEQ) && (SEG_SEQ <= tcb.RCV_NXT+RCV_WND)
+	cond1 := (tcb.RCV_NXT <= SEG_SEQ) && (SEG_SEQ <= tcb.RCV_NXT+uint32(RCV_WND))
 	// Does last part of the segment fall within the window
-	cond2 := (tcb.RCV_NXT <= SEG_SEQ+uint32(SEG_LEN)-1) && (SEG_SEQ+uint32(SEG_LEN)-1 <= tcb.RCV_NXT+RCV_WND)
+	cond2 := (tcb.RCV_NXT <= SEG_SEQ+uint32(SEG_LEN)-1) && (SEG_SEQ+uint32(SEG_LEN)-1 <= tcb.RCV_NXT+uint32(RCV_WND))
 
 	// If either is true, there is data
 	return cond1 || cond2
@@ -524,11 +525,12 @@ func CreateTCBForNormalSocket(sid int, laddr netip.Addr, lport uint16,
 		// Signal the reaper to reap sent SID
 		ReapChan: TCPStack.ReapChan,
 		// ACK signal
-		SBufDataSignal: make(chan SendBufData, 100),
-		RQUpdateCond:   *sync.NewCond(&sync.Mutex{}),
-		ACKCond:        *sync.NewCond(&sync.Mutex{}),
-		SBufPutCond:    *sync.NewCond(&sync.Mutex{}),
-		RBufDataCond:   *sync.NewCond(&sync.Mutex{}),
+		SBufDataCond: *sync.NewCond(&sync.Mutex{}),
+		SBufPutCond:  *sync.NewCond(&sync.Mutex{}),
+		SBufEmptyCond: *sync.NewCond(&sync.Mutex{}),
+		RQUpdateCond:  *sync.NewCond(&sync.Mutex{}),
+		ACKCond:       *sync.NewCond(&sync.Mutex{}),
+		RBufDataCond:  *sync.NewCond(&sync.Mutex{}),
 		// Buffers
 		SendBuffer: socket.InitCircularBuffer(),
 		RecvBuffer: socket.InitCircularBuffer(),
