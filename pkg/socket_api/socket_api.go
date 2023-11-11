@@ -10,11 +10,13 @@ import (
 )
 
 type VTCPListener struct {
+	// Listener Socket
 	InfoChan chan string
 	TCB      *proto.TCB
 }
 
 type VTCPConn struct {
+	// Normal Socket
 	TCB *proto.TCB
 }
 
@@ -81,14 +83,17 @@ func (li *VTCPListener) VAccept(tcbChan chan *proto.TCB) {
 		proto.AddSocketToTable(key, newTCB)
 		// 3
 		newTCB.State = socket.SYN_RECEIVED
+		// - Sender-side Information
 		newTCB.ISS = isn
-		newTCB.LBW = isn
-		newTCB.IRS = tcpPacket.TCPHeader.SeqNum
 		newTCB.SND_UNA = newTCB.ISS
 		newTCB.SND_NXT = newTCB.ISS + 1
+		// - Receiver-side Information
+		newTCB.IRS = tcpPacket.TCPHeader.SeqNum
 		newTCB.RCV_NXT = tcpPacket.TCPHeader.SeqNum + 1
 		newTCB.SND_WND = uint32(tcpPacket.TCPHeader.WindowSize)
+		// - Buffers 
 		newTCB.LBR = tcpPacket.TCPHeader.SeqNum
+		newTCB.LBW = isn
 		// 4
 		for i := 1; i < MAX_RETRANS+1; i++ {
 			suc := _passiveHandshake(newTCB, i)
@@ -96,10 +101,10 @@ func (li *VTCPListener) VAccept(tcbChan chan *proto.TCB) {
 				// Connection is established!
 				li.InfoChan <- fmt.Sprintf("New connection on SID=%d => Created new socket with SID=%d", li.TCB.SID, newTCB.SID)
 				// 5
-				go _doSocket(newTCB)
+				go _doHandleSegment(newTCB)
 				go _doRetransmit(newTCB)
 				go _doManageRQ(newTCB)
-				go monitorSendBuffer(newTCB)
+				go _doMonitorSendBuffer(newTCB)
 				tcbChan <- newTCB
 				break
 			}
@@ -153,10 +158,10 @@ retry:
 		if suc {
 			// SYN was ACK'ed
 			// Dispatch this socket
-			go _doSocket(tcb)
+			go _doHandleSegment(tcb)
 			go _doRetransmit(tcb)
 			go _doManageRQ(tcb)
-			go monitorSendBuffer(tcb)
+			go _doMonitorSendBuffer(tcb)
 			// Return the conn
 			return &VTCPConn{
 				TCB: tcb,

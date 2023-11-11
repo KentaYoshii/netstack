@@ -182,7 +182,7 @@ func _activeHandShake(tcb *proto.TCB, i int) bool {
 
 // Function that sends out data in the send buffer
 // Blocks if there is no data to send out
-func monitorSendBuffer(tcb *proto.TCB) {
+func _doMonitorSendBuffer(tcb *proto.TCB) {
 	for {
 		// Wait for the signal
 		tcb.SBufDataCond.L.Lock()
@@ -255,7 +255,7 @@ func _doManageRQ(tcb *proto.TCB) {
 				if !currSeg.IsRetransmit {
 					// compute and update RTT
 					diff := float64(updateTime.Sub(currSeg.SentAt).Milliseconds())
-					tcb.ComputeRTT(tcb.First, diff)
+					tcb.ComputeRTT(diff)
 				}
 				continue
 			} else {
@@ -345,13 +345,12 @@ func _doSend(tcb *proto.TCB, data []byte) {
 
 // Function that do things socket is meant to do
 // When entering this state, socket is in ESTABLISHED state
-func _doSocket(tcb *proto.TCB) {
+func _doHandleSegment(tcb *proto.TCB) {
 	for {
 		select {
 		case tcpPacket, more := <-tcb.ReceiveChan:
 			{
 				if !more {
-					// RETRANS EXPIRE
 					tcb.ReapChan <- tcb.SID
 					return
 				}
@@ -553,14 +552,6 @@ func _handleAckSeg(tcb *proto.TCB, tcpPacket *proto.TCPPacket) (bool, bool) {
 		}
 	}
 
-	// If we are FIN_WAIT_1 check if this ACK is for FIN
-	if tcb.State == socket.FIN_WAIT_1 {
-		if FIN_ACK_FLAG {
-			// ACK for our FIN
-			tcb.FinOK <- true
-		}
-	}
-
 	// If we are CLOSING check if this ACK is for FIN
 	if tcb.State == socket.CLOSING {
 		if FIN_ACK_FLAG {
@@ -575,8 +566,6 @@ func _handleAckSeg(tcb *proto.TCB, tcpPacket *proto.TCPPacket) (bool, bool) {
 	// If we are LAST_ACK, we just close
 	if tcb.State == socket.LAST_ACK {
 		if FIN_ACK_FLAG {
-			// ACK for our FIN
-			tcb.FinOK <- true
 			// LAST_ACK -> CLOSED
 			tcb.State = socket.CLOSED
 			// Delete TCB

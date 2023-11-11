@@ -289,7 +289,7 @@ func (r *Repl) handleSocketReceive(args []string) string {
 		return ""
 	}
 
-	// Suppress
+	// suppress
 	if sup {
 		return b.String()
 	}

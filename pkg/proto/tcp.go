@@ -16,15 +16,16 @@ import (
 const (
 	MAX_WND_SIZE       = 65535
 	DEFAULT_DATAOFFSET = 20
+	// Retransmission Related
 	MAX_RTO            = 5000
 	MIN_RTO            = 100
 	RTT_ALPHA          = 0.8
 	RTT_BETA           = 1.5
-	RTT_K              = 4
-	RTT_G              = 10
 )
 
 type TCPPacket struct {
+	// Struct that represents single TCPPacket
+
 	LAddr     netip.Addr
 	RAddr     netip.Addr
 	TCPHeader *header.TCPFields
@@ -32,88 +33,107 @@ type TCPPacket struct {
 }
 
 type RQSegment struct {
+	// Struct that gets put in the Retransmission Queue
+	// Contains meta data about the packet
+
 	Packet       *TCPPacket
 	SentAt       time.Time
 	IsRetransmit bool
 }
 
-type SendBufData struct {
-	Flag uint8
-}
-
 type TCB struct {
-	SID   int // Socket Id
-	State int // Socket State
+	// Struct that represents Transmission Control Block (TCB)
 
-	Laddr netip.Addr // my ip addr
-	Lport uint16     // my ip port
+	// Associated Socket Id
+	SID int
+	// TCB State
+	State int
 
-	Raddr netip.Addr // other ip addr
-	Rport uint16     // other ip port
+	// 4-tuple
+	Laddr netip.Addr
+	Lport uint16
+	Raddr netip.Addr
+	Rport uint16
 
 	// Communication between IP Stack and TCP Stack
 	ReceiveChan chan *TCPPacket
 	SendChan    chan *TCPPacket
-	// Signal Our FIN is ACK'ed
-	FinOK chan bool
-	// Timer Reset (TIME_WAIT)
+
+	// TIME_WAIT timer reset channel
 	TimeReset chan bool
-	// Signal the Reaper for removeal
+	// Signal the Reaper for TCB removeal
+	// after entering CLOSED state
 	ReapChan chan int
-	// ACK signal
+	// Update to ACK cond
+	// - when you receive new ACK number
 	ACKCond sync.Cond
-	// Update RQ
+	// Update to RQ cond
+	// - when you receive new ACK number
 	RQUpdateCond sync.Cond
-
-	// Data signal
-
-	SBufDataCond  sync.Cond
-	SBufPutCond   sync.Cond
+	// Update the thread that sends out data in send buffer
+	SBufDataCond sync.Cond
+	// Update the thread that puts data into send buffer
+	SBufPutCond sync.Cond
+	// Update the thread that send buffre is empty
+	// - when waiting to send out FIN packet
 	SBufEmptyCond sync.Cond
-	RBufDataCond  sync.Cond
+	// Update the reader that there is data to read in receive buffer
+	RBufDataCond sync.Cond
 
-	// Pointers to Buffers
+	// Circular Send Buffer
 	SendBuffer *socket.CircularBuffer
+	// Circular Receive Buffer
 	RecvBuffer *socket.CircularBuffer
-	// Early Arrival Queue
+	// Early Arrivals Queue
 	EarlyArrivals []*TCPPacket
 
-	// --- Retransmission ---
+	// Retransmission Queue
 	RetransmissionQ []*RQSegment
-	RQMu            sync.Mutex
-	RQTicker        *time.Ticker
+	// Mutex for updating Retransmission Queue
+	RQMu sync.Mutex
+	// Ticker for Retransmitting oldest unACK'ed segment
+	RQTicker *time.Ticker
 	// Retransmission Timeout (in ms)
-	First     bool
-	RTO       float64
+	RTO float64
+	// True if RTO timer is running
 	RTOStatus bool
-	SRTT      float64
-	// ----------------------
+	// Smooth Round Trip Time
+	SRTT float64
+	// True if updating RTO for the first time
+	First bool
 
 	// Initial Sequence Numbers
 	ISS uint32
 	IRS uint32
 
 	// Connection State Variables
+
+	// - Oldest un-ACK'ed sequence number
 	SND_UNA uint32
+	// - Next sequence number to send
 	SND_NXT uint32
+	// - Send Window
 	SND_WND uint32
-	SND_WL1 uint32
-	SND_WL2 uint32
+	// - Next sequence number we expect to receive
 	RCV_NXT uint32
+	// - Receive Window
 	RCV_WND uint32
 
-	// Last Byte Read
+	// Last Byte Read in Receive Buffer
 	LBR uint32
-	// Last Byte Written
+	// Last Byte Written in Send Buffer
 	LBW uint32
 
-	// Zero Window Probing
-	ProbeStatus     bool
+	// True if Zero Window Probing
+	ProbeStatus bool
+	// Signal to stop Zero Window Probing
 	ProbeStopSignal chan bool
 }
 
 type SocketTableKey struct {
-	// The 4-tuple maps to a single socket
+	// The 4-tuple
+	// - This maps to a single TCB
+
 	Laddr netip.Addr
 	Lport uint16
 	Raddr netip.Addr
@@ -121,7 +141,9 @@ type SocketTableKey struct {
 }
 
 type TCPStackT struct {
-	// counter used for clock-based ISN generation
+	// Struct that represents TCPStack
+
+	// Counter used for clock-based ISN generation
 	// (RFC 9293: 3.4.1)
 	ISNCTR uint32
 	// Next Available Socket ID
@@ -142,7 +164,7 @@ type TCPStackT struct {
 // Global Socket Table
 var TCPStack *TCPStackT
 
-// Function that initializes our Socket Table for hosts
+// Function that initializes TCP stack
 func InitializeTCPStack(sendChan chan *TCPPacket) {
 	TCPStack = &TCPStackT{
 		ISNCTR:        0,
@@ -153,11 +175,15 @@ func InitializeTCPStack(sendChan chan *TCPPacket) {
 		SendChan:      sendChan,
 		ReapChan:      make(chan int, 100),
 	}
+	// Start the ISN generator
 	go util.KeepIncrement(&TCPStack.ISNCTR)
+	// Start the repear of SID
 	go TCPStack.Reap()
 }
 
-// =================== Helper ===================
+// Function that trims the payload of the given tcpPacket
+// based on the current state of TCB
+// Returns the trimmed payload and the size of that payload
 func (tcb *TCB) TrimSegment(tcpPacket *TCPPacket) ([]byte, uint16) {
 	SEG_SEQ := tcpPacket.TCPHeader.SeqNum
 	SEG_LEN := uint16(len(tcpPacket.Payload))
@@ -166,6 +192,7 @@ func (tcb *TCB) TrimSegment(tcpPacket *TCPPacket) ([]byte, uint16) {
 	// Compute the offset to the first new byte
 	start := tcb.RCV_NXT - SEG_SEQ
 	if start != 0 {
+		// If non-zero, trim the irrelevant beginning bytes
 		SEG_DATA = SEG_DATA[start:]
 		SEG_LEN = uint16(len(SEG_DATA))
 	}
@@ -176,16 +203,17 @@ func (tcb *TCB) TrimSegment(tcpPacket *TCPPacket) ([]byte, uint16) {
 	return SEG_DATA, SEG_LEN
 }
 
-// Function that starts Ticker
+// Function that gets a current RTO in time.Duration
 func (tcb *TCB) GetRTO() time.Duration {
 	tcb.RTOStatus = true
 	return time.Duration(tcb.RTO * float64(time.Millisecond))
 }
 
-// Function that computes the RTT
-// (RFC 793)
-func (tcb *TCB) ComputeRTT(initial bool, r float64) {
-	if initial {
+// Function that computes the RTT based on RFC 793
+// Takes in a measured RTT of a normal segment
+// Sets SRTT and RTO
+func (tcb *TCB) ComputeRTT(r float64) {
+	if tcb.First {
 		tcb.SRTT = r
 		tcb.First = false
 	} else {
@@ -198,22 +226,23 @@ func (tcb *TCB) ComputeRTT(initial bool, r float64) {
 // Insert so that Early Arrival Packets are in order of their sequence numbers
 // Example:
 // If you have EAQ of 1 4 5 6
-// - You get packet with seq 3
-// - Insert position is hence 1 (after 1)
-// - Append a temp slice 1 4 5 6 temp
-// - Copy (1 4 4 5 6) and update insert pos
+// - You get early arrival packet with seq 3
 // - Result is 1 3 4 5 6
+// Returns true if successfully inserted
 func (tcb *TCB) InsertEAQ(packet *TCPPacket) bool {
 	if len(tcb.EarlyArrivals) == 0 {
+		// If length is zero, simply append
 		tcb.EarlyArrivals = append(tcb.EarlyArrivals, packet)
 		return true
 	}
+	// Find the insert position
+	// Sequence number is strictly increasing
 	insertPos := 0
 	found := false
 	insertSeq := packet.TCPHeader.SeqNum
 	for i, curr := range tcb.EarlyArrivals {
 		if insertSeq == curr.TCPHeader.SeqNum {
-			// We already have this in our early arrivals queue => nop
+			// We already have this in our early arrivals queue
 			return false
 		}
 		if curr.TCPHeader.SeqNum > insertSeq {
@@ -225,7 +254,8 @@ func (tcb *TCB) InsertEAQ(packet *TCPPacket) bool {
 	}
 	var q []*TCPPacket
 	if !found {
-		// Append
+		// If not found, that means this packet has the largest
+		// sequence number
 		q = append(tcb.EarlyArrivals, packet)
 	} else {
 		// Insert
@@ -240,9 +270,12 @@ func (tcb *TCB) InsertEAQ(packet *TCPPacket) bool {
 	return true
 }
 
-// Given end sequence number (incl.) of current segment data
-// Loop the EAQ and merge data
+// Given the next sequence number, loop the EAQ and merge data
+// until we merge all possible early arrival segments or run out of
+// receive window
+// Returns merged data and the size of that new merged data
 func (tcb *TCB) MergeEAQ(start uint32, currData []byte) ([]byte, uint16) {
+	// Get the Receive Window space
 	available := tcb.GetAdvertisedWND() - uint16(len(currData))
 	if available == 0 {
 		// No space available in recv buf
@@ -252,11 +285,11 @@ func (tcb *TCB) MergeEAQ(start uint32, currData []byte) ([]byte, uint16) {
 		currSEQ := curr.TCPHeader.SeqNum
 		currEND := currSEQ + uint32(len(curr.Payload)) - 1
 		if currEND < start {
-			// already received
+			// We already have this segment
 			continue
 		}
 		if currSEQ > start {
-			// not contiguous -> cannot receive
+			// Not contiguous, we cannot receive
 			// - remove all the preceding segments
 			tcb.EarlyArrivals = tcb.EarlyArrivals[i:]
 			return currData, uint16(len(currData))
@@ -309,7 +342,11 @@ func (tcb *TCB) MergeEAQ(start uint32, currData []byte) ([]byte, uint16) {
 	return currData, uint16(len(currData))
 }
 
-// Get the useable window given a TCB state
+// Get the bytes in send window given a TCB state
+//
+//	u     n    u+s
+//
+// [+ + + + - - +]
 func (tcb *TCB) GetNumBytesInSNDWND() uint16 {
 	return uint16(tcb.SND_UNA + tcb.SND_WND - tcb.SND_NXT)
 }
@@ -319,8 +356,6 @@ func (tcb *TCB) GetNumBytesInSNDWND() uint16 {
 //	n         l
 //
 // [+ + + + + + f f f f]
-// lbw = 9, snd_nx = 4 so 9 - 4 + 1 = 6 unsent bytes
-// 10 - 6 = 4 bytes that we can overwrite
 func (tcb *TCB) GetNumFreeBytesInSNDBUF() uint16 {
 	return uint16(MAX_WND_SIZE - (tcb.LBW - tcb.SND_NXT + 1))
 }
@@ -358,16 +393,16 @@ func (tcb *TCB) GetAdvertisedWND() uint16 {
 }
 
 // Gets the number of unread bytes in the recv buffer
+//
+//	l          rn
+//
+// [r r r r nr nr nr +]
 func (tcb *TCB) GetUnreadBytes() uint16 {
 	return uint16((tcb.RCV_NXT - 1) - tcb.LBR)
 }
 
-// Send is done if retransmission queue is empty
-func (tcb *TCB) IsSendDone() bool {
-	return len(tcb.RetransmissionQ) == 0
-}
-
-// Reap the sockets that expired
+// Reaps the sockets that expired
+// SID is sent through the ReapChan
 func (stack *TCPStackT) Reap() {
 	// SID to remove
 	for sid := range stack.ReapChan {
@@ -378,17 +413,22 @@ func (stack *TCPStackT) Reap() {
 	}
 }
 
-// Given TCB state, create an ACK packet with the current variables and passed-in flags
+// Given TCB state, create an ACK packet with the current
+// variables and passed-in flags
+// Return the sent out TCPPacket
 func (tcb *TCB) SendACKPacket(flag uint8, data []byte) *TCPPacket {
+	// TCP Header
 	hdr := util.CreateTCPHeader(tcb.Lport, tcb.Rport, tcb.SND_NXT,
 		tcb.RCV_NXT, DEFAULT_DATAOFFSET, flag,
 		uint16(tcb.GetAdvertisedWND()))
+	// Create the Packet
 	tcpPacket := &TCPPacket{
 		LAddr:     tcb.Laddr,
 		RAddr:     tcb.Raddr,
 		TCPHeader: hdr,
 		Payload:   data,
 	}
+	// Send out
 	tcb.SendChan <- tcpPacket
 	return tcpPacket
 }
@@ -408,6 +448,7 @@ func (tcb *TCB) PrintTCBState() {
 	fmt.Println("---------------------")
 }
 
+// Helper to print out the outgoing segment
 func (tcb *TCB) PrintOutgoingSegment(seg *TCPPacket) {
 	iss := tcb.ISS
 	irs := tcb.IRS
@@ -419,6 +460,7 @@ func (tcb *TCB) PrintOutgoingSegment(seg *TCPPacket) {
 	fmt.Println("-------------------")
 }
 
+// Helper to print out the incoming segment
 func (tcb *TCB) PrintSegment(seg *TCPPacket) {
 	iss := tcb.ISS
 	irs := tcb.IRS
@@ -431,10 +473,13 @@ func (tcb *TCB) PrintSegment(seg *TCPPacket) {
 }
 
 // Given TCB state, check if incoming segment is valid or not
+// We do that by checking the sequence number, receiving window,
+// and segment length
 func (tcb *TCB) IsSegmentValid(tcpPacket *TCPPacket) bool {
 	SEG_LEN := len(tcpPacket.Payload)
 	SEG_SEQ := tcpPacket.TCPHeader.SeqNum
 	RCV_WND := tcb.GetAdvertisedWND()
+
 	// Four CASES
 
 	// Case 1: SEG_LEN = 0 && RECV_WND = 0
@@ -469,7 +514,9 @@ func (tcb *TCB) IsSegmentValid(tcpPacket *TCPPacket) bool {
 	return cond1 || cond2
 }
 
-// Look up on socket table
+// Look up on socket table given a 4-tuple
+// Returns the TCB and true, if found
+// Returns nil and false, if not found
 func SocketTableLookup(key SocketTableKey) (*TCB, bool) {
 	TCPStack.StMtx.Lock()
 	defer TCPStack.StMtx.Unlock()
@@ -478,6 +525,8 @@ func SocketTableLookup(key SocketTableKey) (*TCB, bool) {
 }
 
 // Given a SID, return the TCB
+// Returns the TCB and true, if found
+// Returns nil and false, if not found
 func SIDToTCB(sid int) (*TCB, bool) {
 	key, ok := TCPStack.SIDToTableKey[sid]
 	if !ok {
@@ -508,43 +557,31 @@ func CreateTCBForListenSocket(sid int, port uint16) *TCB {
 func CreateTCBForNormalSocket(sid int, laddr netip.Addr, lport uint16,
 	raddr netip.Addr, rport uint16) *TCB {
 	return &TCB{
-		// Basic Connection Information
-		SID:   sid,
-		State: socket.LISTEN,
-		Laddr: laddr,
-		Lport: lport,
-		Raddr: raddr,
-		Rport: rport,
-		// IPStack <=> Socket(s)
-		ReceiveChan: make(chan *TCPPacket, 100),
-		SendChan:    TCPStack.SendChan,
-		// Sent when our FIN packet was ACK'ed
-		FinOK: make(chan bool, 100),
-		// Reset chan for restarting TIME-WAIT timer
-		TimeReset: make(chan bool, 100),
-		// Signal the reaper to reap sent SID
-		ReapChan: TCPStack.ReapChan,
-		// ACK signal
-		SBufDataCond: *sync.NewCond(&sync.Mutex{}),
-		SBufPutCond:  *sync.NewCond(&sync.Mutex{}),
+		SID:          sid,
+		State:        socket.LISTEN,
+		Laddr:        laddr,
+		Lport:        lport,
+		Raddr:        raddr,
+		Rport:        rport,
+		ReceiveChan:  make(chan *TCPPacket, 100),
+		SendChan:     TCPStack.SendChan,
+		TimeReset:    make(chan bool, 100),
+		ReapChan:     TCPStack.ReapChan,
+		ACKCond:      *sync.NewCond(&sync.Mutex{}),
+		RQUpdateCond: *sync.NewCond(&sync.Mutex{}),
+		SBufDataCond:  *sync.NewCond(&sync.Mutex{}),
+		SBufPutCond:   *sync.NewCond(&sync.Mutex{}),
 		SBufEmptyCond: *sync.NewCond(&sync.Mutex{}),
-		RQUpdateCond:  *sync.NewCond(&sync.Mutex{}),
-		ACKCond:       *sync.NewCond(&sync.Mutex{}),
 		RBufDataCond:  *sync.NewCond(&sync.Mutex{}),
-		// Buffers
 		SendBuffer: socket.InitCircularBuffer(),
 		RecvBuffer: socket.InitCircularBuffer(),
-		// Early Arrival Queue
 		EarlyArrivals: make([]*TCPPacket, 0),
-		// Retransmission Queue
 		RetransmissionQ: make([]*RQSegment, 0),
-		First:           true,
+		RQTicker:        time.NewTicker(time.Duration(MIN_RTO * float64(time.Millisecond))),
 		RTO:             100,
 		RTOStatus:       false,
-		RQTicker:        time.NewTicker(time.Duration(MIN_RTO * float64(time.Millisecond))),
-		// Receive Window is max initially
+		First:           true,
 		RCV_WND: MAX_WND_SIZE,
-		// Last Byte Read
 		LBR:             0,
 		LBW:             0,
 		ProbeStatus:     false,
@@ -552,13 +589,13 @@ func CreateTCBForNormalSocket(sid int, laddr netip.Addr, lport uint16,
 	}
 }
 
-// Add Key and Value to Socket Table
+// Given "key" and "value", add the pair to the Socket Table
 func AddSocketToTable(key SocketTableKey, value *TCB) {
 	TCPStack.SocketTable[key] = value
 	TCPStack.SIDToTableKey[value.SID] = key
 }
 
-// Remove Socket from Table
+// Given 4-tuple key, remove the associated socket from Socket Table
 func RemoveSocketFromTable(key SocketTableKey) {
 	tcb := TCPStack.SocketTable[key]
 	// Remove from SID to Key map
@@ -573,6 +610,7 @@ func RemoveSocketFromTable(key SocketTableKey) {
 }
 
 // Given a port, bind to that port
+// Returns false if port already bound
 func BindPort(toBind int) bool {
 	if val, ok := TCPStack.BoundPorts[toBind]; ok && val {
 		return false
@@ -581,14 +619,14 @@ func BindPort(toBind int) bool {
 	return true
 }
 
-// Allocate a socket id for new socket
+// Allocate a socket id for the new socket
 func AllocSID() int {
 	toRet := TCPStack.NextSID
 	TCPStack.NextSID++
 	return toRet
 }
 
-// Create the 4-tuple
+// Create the 4-tuple key based on network information
 func CreateSocketTableKey(l bool, laddr netip.Addr, lport uint16,
 	raddr netip.Addr, rport uint16) SocketTableKey {
 	if l {
@@ -609,6 +647,11 @@ func CreateSocketTableKey(l bool, laddr netip.Addr, lport uint16,
 }
 
 // TCP Protocol (6)
+// - Parse the IP Packet
+// - Compute TCP Checksum
+// - Lookup which TCB to forward the packet to
+// - Forward
+// 	 - drop the packet if look up fails
 func HandleTCPProtocol(packet *packet.Packet, l *slog.Logger) {
 	// First get the payload and unmarshal
 	tcpHdr := util.ParseTCPHeader(packet.Payload)
@@ -647,6 +690,5 @@ func HandleTCPProtocol(packet *packet.Packet, l *slog.Logger) {
 		tcb.ReceiveChan <- tcpPacket
 		return
 	}
-
 	l.Info("Received TCP Packet destined to unknown application")
 }
