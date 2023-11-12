@@ -311,14 +311,20 @@ func _doRetransmit(tcb *proto.TCB) {
 					tcb.CWND = MAX_SEG_SIZE
 				}
 				toReTrans.IsRetransmit = true
-				toReTrans.Packet.TCPHeader.WindowSize = uint16(tcb.GetAdvertisedWND())
-				toReTrans.Packet.TCPHeader.AckNum = tcb.RCV_NXT
-				toReTrans.Packet.TCPHeader.Checksum = 0
+				cpHdr := util.CopyTCPHeader(toReTrans.Packet.TCPHeader)
+				cpHdr.WindowSize = uint16(tcb.GetAdvertisedWND())
+				cpHdr.AckNum = tcb.RCV_NXT
+				cpHdr.Checksum = 0
 				proto.Log(
 					fmt.Sprintf("Retransmitting SEG_SEQ=%d, UNA=%d, RTO=%f",
 						toReTrans.Packet.TCPHeader.SeqNum-tcb.ISS,
 						tcb.SND_UNA-tcb.ISS, tcb.RTO), util.INFO)
-				tcb.SendChan <- toReTrans.Packet
+				tcb.SendChan <- &proto.TCPPacket{
+					LAddr:     toReTrans.Packet.LAddr,
+					RAddr:     toReTrans.Packet.RAddr,
+					TCPHeader: cpHdr,
+					Payload:   toReTrans.Packet.Payload,
+				}
 				// (5.5) RTO <- 2 * RTO
 				tcb.RTO = min(proto.MAX_RTO, 2*tcb.RTO)
 				// (5.6) Restart the Retransmission Timer
@@ -539,6 +545,8 @@ func _handleAckSeg(tcb *proto.TCB, tcpPacket *proto.TCPPacket) (bool, bool) {
 		tcb.ProbeStatus = false
 	}
 
+	var dupACK bool = false
+
 	if tcb.SND_UNA < SEG_ACK && SEG_ACK <= tcb.SND_NXT {
 		// Some of the in-flith bytes have been ACK'ed
 
@@ -566,6 +574,8 @@ func _handleAckSeg(tcb *proto.TCB, tcpPacket *proto.TCPPacket) (bool, bool) {
 
 		// Update the SND.UNA
 		tcb.SND_UNA = SEG_ACK
+		// Reset Dup ACK
+		tcb.DupACKCount = 0
 		// (5.3) When an ACK is received that acknowledges
 		// new data, restart the retransmission timer so
 		// that it will expire after RTO seconds
@@ -590,7 +600,28 @@ func _handleAckSeg(tcb *proto.TCB, tcpPacket *proto.TCPPacket) (bool, bool) {
 			(tcb.SND_UNA != tcb.SND_NXT) &&
 			(tcpPacket.TCPHeader.Flags&util.FIN == 0) &&
 			(tcb.SND_WND == uint32(SEG_WND)) {
-			// fmt.Println("Duplicate ACK", "SEG_ACK=", SEG_ACK-tcb.ISS)
+			dupACK = true
+			tcb.DupACKCount += 1
+			if tcb.DupACKCount == 3 && tcb.CCEnabled {
+				// Both Tahoe and Reno do Fast Retransmit
+				tcb.FastRetransmit()
+				if tcb.CCAlgo == "tahoe" {
+					// Tahoe
+					// - update ssthresh
+					// - update cwnd <- MSS
+					tcb.SSThresh = max(tcb.GetNumBytesInFlight()/2, 2*MAX_SEG_SIZE)
+					tcb.CWND = MAX_SEG_SIZE
+				} else if tcb.CCAlgo == "reno" {
+					// Reno
+					// - cwnd' <- cwnd / 2
+					// - ssthresh <- cwnd'
+					tcb.CWND = tcb.CWND / 2
+					tcb.SSThresh = tcb.CWND
+				}
+				tcb.DupACKCount = 0
+			}
+		} else {
+			tcb.DupACKCount = 0
 		}
 	} else if SEG_ACK > tcb.SND_NXT {
 		// ACK for unsent stuff (ACK and drop)
@@ -601,7 +632,7 @@ func _handleAckSeg(tcb *proto.TCB, tcpPacket *proto.TCPPacket) (bool, bool) {
 	}
 
 	// Update send window
-	if tcb.SND_UNA <= SEG_ACK && SEG_ACK <= tcb.SND_NXT {
+	if tcb.SND_UNA <= SEG_ACK && SEG_ACK <= tcb.SND_NXT && !dupACK {
 		tcb.SND_WND = uint32(SEG_WND)
 		// If window size is 0, we probe
 		if SEG_WND == 0 && !tcb.ProbeStatus {
@@ -658,9 +689,6 @@ func _doZWP(tcb *proto.TCB) {
 	}
 
 	proto.Log("Starting Zero Window Probing", util.INFO)
-
-	// Else stop the RTO
-	tcb.RQTicker.Stop()
 
 	// Get 1 byte data segment
 	zwp_payload := make([]byte, 1)

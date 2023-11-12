@@ -86,6 +86,21 @@ func CreateTCPHeader(srcP uint16, dstP uint16, seq uint32,
 	}
 }
 
+// Copy a TCP Header
+func CopyTCPHeader(hdr *header.TCPFields) *header.TCPFields {
+	return &header.TCPFields{
+		SrcPort:       hdr.SrcPort,
+		DstPort:       hdr.DstPort,
+		SeqNum:        hdr.SeqNum,
+		AckNum:        hdr.AckNum,
+		DataOffset:    hdr.DataOffset,
+		Flags:         hdr.Flags,
+		WindowSize:    hdr.WindowSize,
+		Checksum:      hdr.Checksum,
+		UrgentPointer: hdr.UrgentPointer,
+	}
+}
+
 // Serialize TCPHeader
 func MarshalTCPHeader(hdr *header.TCPFields) header.TCP {
 	// Serialize the TCP header

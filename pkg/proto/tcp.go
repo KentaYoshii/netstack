@@ -2,6 +2,7 @@ package proto
 
 import (
 	"errors"
+	"fmt"
 	"log/slog"
 	"net/netip"
 	"netstack/pkg/packet"
@@ -146,6 +147,11 @@ type TCB struct {
 	NumBytesACK uint16
 	// Flag to see if we can increment CWND during CA
 	CAIncrementFlag bool
+
+	// Fast Retransmit
+
+	// Duplicate ACK count
+	DupACKCount int
 }
 
 type SocketTableKey struct {
@@ -387,7 +393,7 @@ func (tcb *TCB) IsSlowStart() bool {
 	return tcb.CWND < tcb.SSThresh
 }
 
-// Returns the number of bytes available in the send window 
+// Returns the number of bytes available in the send window
 // If congestion control is enabled, then CWND is taken into consideration
 func (tcb *TCB) GetNumFreeBytesInSNDWND() uint16 {
 	sndWNDSZ := tcb.GetNumBytesInSNDWND()
@@ -395,8 +401,8 @@ func (tcb *TCB) GetNumFreeBytesInSNDWND() uint16 {
 		// If no CC is used, we can just return the number of free bytes in SND_WND
 		return sndWNDSZ
 	}
-	// At any given time, a TCP MUST NOT send data with a sequence number 
-	// higher than the sum of the highest acknowledged sequence number and 
+	// At any given time, a TCP MUST NOT send data with a sequence number
+	// higher than the sum of the highest acknowledged sequence number and
 	// the minimum of cwnd and rwnd.
 	//           una     nxt
 	// [A A A A A U U U U - - - - ] (A = ACK'ed, U = unACK'ed, CWND = 6)
@@ -504,6 +510,33 @@ func (tcb *TCB) SendACKPacket(flag uint8, data []byte) *TCPPacket {
 	return tcpPacket
 }
 
+// Performs a fast retransmission of the oldest unACK'ed segment
+// as a result of 3 dup ACKs
+func (tcb *TCB) FastRetransmit() {
+	if len(tcb.RetransmissionQ) == 0 {
+		return
+	}
+	tcb.RQMu.Lock()
+	toReTrans := tcb.RetransmissionQ[0]
+	tcb.RQMu.Unlock()
+	toReTrans.IsRetransmit = true
+	cpHdr := util.CopyTCPHeader(toReTrans.Packet.TCPHeader)
+	cpHdr.WindowSize = uint16(tcb.GetAdvertisedWND())
+	cpHdr.AckNum = tcb.RCV_NXT
+	cpHdr.Checksum = 0
+	Log(
+		fmt.Sprintf("Fast-Retransmitting SEG_SEQ=%d, UNA=%d, RTO=%f",
+			toReTrans.Packet.TCPHeader.SeqNum-tcb.ISS,
+			tcb.SND_UNA-tcb.ISS, tcb.RTO), util.INFO)
+	tcb.SendChan <- &TCPPacket{
+		LAddr: toReTrans.Packet.LAddr,
+		RAddr: toReTrans.Packet.RAddr,
+		TCPHeader: cpHdr,
+		Payload: toReTrans.Packet.Payload,
+	}
+	tcb.RQTicker.Reset(tcb.GetRTO())
+}
+
 // Given TCB state, check if incoming segment is valid or not
 // We do that by checking the sequence number, receiving window,
 // and segment length
@@ -566,8 +599,8 @@ func (tcb *TCB) SetCongestionControl(cc string) error {
 	return nil
 }
 
-// Function that sets the flag for incrementing cwnd to true every RTT 
-// This is to prevent CWND updates from happening too often 
+// Function that sets the flag for incrementing cwnd to true every RTT
+// This is to prevent CWND updates from happening too often
 // (more than once every RTT)
 func CongestionAvoidanceRTT(tcb *TCB) {
 	for {
