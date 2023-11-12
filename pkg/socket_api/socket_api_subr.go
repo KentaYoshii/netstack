@@ -194,13 +194,13 @@ func _doMonitorSendBuffer(tcb *proto.TCB) {
 		// While we have bytes to send out or FIN bit is set
 		for bytesToSend > 0 {
 			// Then check if we have space in snd wnd
-			sndWNDSZ := tcb.GetNumBytesInSNDWND()
+			sndWNDSZ := tcb.GetNumFreeBytesInSNDWND()
 			tcb.ACKCond.L.Lock()
 			for sndWNDSZ == 0 {
 				// Sleep until we are signalled that some of the in-flight
 				// bytes have been ACK'ed
 				tcb.ACKCond.Wait()
-				sndWNDSZ = tcb.GetNumBytesInSNDWND()
+				sndWNDSZ = tcb.GetNumFreeBytesInSNDWND()
 			}
 			tcb.ACKCond.L.Unlock()
 			// We can send the entire bytesToSend or whatever we can fit into send window
@@ -213,7 +213,6 @@ func _doMonitorSendBuffer(tcb *proto.TCB) {
 			// Update SND_NXT
 			tcb.SND_NXT += uint32(can_send)
 			bytesToSend -= can_send
-
 			// Add to RQ and start the retransmissoin clock
 			// - RTT sample can only be taken for normal packet
 			tcb.RQMu.Lock()
@@ -296,15 +295,32 @@ func _doRetransmit(tcb *proto.TCB) {
 				// (RFC 6298)
 				// (5.4) Retransmit the oldest unACK'ed segment
 				tcb.RQMu.Lock()
-				tcb.RetransmissionQ[0].IsRetransmit = true
-				tcb.RetransmissionQ[0].Packet.TCPHeader.WindowSize = uint16(tcb.GetAdvertisedWND())
-				tcb.RetransmissionQ[0].Packet.TCPHeader.AckNum = tcb.RCV_NXT
-				tcb.RetransmissionQ[0].Packet.TCPHeader.Checksum = 0
+				toReTrans := tcb.RetransmissionQ[0]
+				// Congestion Control
+				if tcb.CCEnabled {
+					if !toReTrans.IsRetransmit {
+						// Detects loss and this segment has not yet been resent
+						// - update ssthresh to be max of
+						// 	 - FlightSize / 2
+						//   - 2 * MSS
+						tcb.SSThresh = max(tcb.GetNumBytesInFlight()/2, 2*MAX_SEG_SIZE)
+					}
+					// Upon one RTO, CWND <- MSS, back to "slow start" mode
+					go func() {
+						tick := time.NewTicker(tcb.GetRTO())
+						<-tick.C
+						tcb.CWND = MAX_SEG_SIZE
+					}()
+				}
+				toReTrans.IsRetransmit = true
+				toReTrans.Packet.TCPHeader.WindowSize = uint16(tcb.GetAdvertisedWND())
+				toReTrans.Packet.TCPHeader.AckNum = tcb.RCV_NXT
+				toReTrans.Packet.TCPHeader.Checksum = 0
 				proto.Log(
 					fmt.Sprintf("Retransmitting SEG_SEQ=%d, UNA=%d, RTO=%f",
-						tcb.RetransmissionQ[0].Packet.TCPHeader.SeqNum-tcb.ISS,
+						toReTrans.Packet.TCPHeader.SeqNum-tcb.ISS,
 						tcb.SND_UNA-tcb.ISS, tcb.RTO), util.INFO)
-				tcb.SendChan <- tcb.RetransmissionQ[0].Packet
+				tcb.SendChan <- toReTrans.Packet
 				tcb.RQMu.Unlock()
 				// (5.5) RTO <- 2 * RTO
 				tcb.RTO = min(proto.MAX_RTO, 2*tcb.RTO)
@@ -523,8 +539,33 @@ func _handleAckSeg(tcb *proto.TCB, tcpPacket *proto.TCPPacket) (bool, bool) {
 	}
 
 	if tcb.SND_UNA < SEG_ACK && SEG_ACK <= tcb.SND_NXT {
+		// Some of the in-flith bytes have been ACK'ed
+
+		// Congestion Control
+		if tcb.CCEnabled {
+			if tcb.IsSlowStart() {
+				// Slow Start
+				// - increment by min(MSS, number of bytes ACK'ed)
+				tcb.CWND += min(MAX_SEG_SIZE, uint16(SEG_ACK-tcb.SND_UNA))
+				tcb.NumBytesACK = 0
+			} else {
+				// Congestion Avoidance
+				// - count the number of bytes ACK'ed
+				// - if it reaches cwnd, then increment by MSS
+				// - can only be incremented once every RTT
+				tcb.NumBytesACK += uint16(SEG_ACK - tcb.SND_UNA)
+				if tcb.NumBytesACK >= tcb.CWND && tcb.CAIncrementFlag {
+					tcb.CWND += MAX_SEG_SIZE
+					tcb.NumBytesACK = 0
+					tcb.CAIncrementFlag = false
+				}
+			}
+
+		}
+
 		// Update the SND.UNA
 		tcb.SND_UNA = SEG_ACK
+		// - (slow start) cwnd += min(N, MSS) where N is number of bytes newly ACK'ed
 		// (5.3) When an ACK is received that acknowledges
 		// new data, restart the retransmission timer so
 		// that it will expire after RTO seconds

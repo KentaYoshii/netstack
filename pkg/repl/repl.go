@@ -420,7 +420,11 @@ func (r *Repl) handleSocketSendFile(args []string) string {
 
 	// Turn on Congestion Control if provided
 	if len(args) == 5 {
-		conn.TCB.SetCongestionControl(args[4])
+		err = conn.TCB.SetCongestionControl(args[4])
+		if err != nil {
+			r.HostInfo.Logger.Error(err.Error())
+			return ""
+		}
 	}
 
 	// Send file

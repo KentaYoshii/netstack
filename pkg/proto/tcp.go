@@ -2,6 +2,7 @@ package proto
 
 import (
 	"errors"
+	"fmt"
 	"log/slog"
 	"net/netip"
 	"netstack/pkg/packet"
@@ -141,6 +142,11 @@ type TCB struct {
 	CWND uint16
 	// Slow Start Threshold
 	SSThresh uint16
+	// Number of Bytes ACK'ed
+	// - Use during Congestion Avoidance
+	NumBytesACK uint16
+	// Flag to see if we can increment CWND during CA
+	CAIncrementFlag bool
 }
 
 type SocketTableKey struct {
@@ -376,15 +382,34 @@ func (tcb *TCB) MergeEAQ(start uint32, currData []byte) ([]byte, uint16) {
 	return currData, uint16(len(currData))
 }
 
+// Returns true if this socket is in the Slow Start mode
+// Retruns false otherwise (e.g., it is in Congestion Avoidance mode)
 func (tcb *TCB) IsSlowStart() bool {
 	return tcb.CWND < tcb.SSThresh
+}
+
+// Returns the number of bytes available in the send window 
+// If congestion control is enabled, then CWND is taken into consideration
+func (tcb *TCB) GetNumFreeBytesInSNDWND() uint16 {
+	sndWNDSZ := tcb.GetNumBytesInSNDWND()
+	if !tcb.CCEnabled {
+		// If no CC is used, we can just return the number of free bytes in SND_WND
+		return sndWNDSZ
+	}
+	// At any given time, a TCP MUST NOT send data with a sequence number 
+	// higher than the sum of the highest acknowledged sequence number and 
+	// the minimum of cwnd and rwnd.
+	//           una     nxt
+	// [A A A A A U U U U - - - - ] (A = ACK'ed, U = unACK'ed, CWND = 6)
+	Log(fmt.Sprintf("RWND_remain=%d, CWND_remain=%d", sndWNDSZ, tcb.CWND-tcb.GetNumBytesInFlight()), util.INFO)
+	return min(tcb.CWND-tcb.GetNumBytesInFlight(), sndWNDSZ)
 }
 
 // Get the bytes in send window given a TCB state
 //
 //	u     n    u+s
 //
-// [+ + + + - - +]
+// [+ + + - - - -]
 func (tcb *TCB) GetNumBytesInSNDWND() uint16 {
 	return uint16(tcb.SND_UNA + tcb.SND_WND - tcb.SND_NXT)
 }
@@ -432,6 +457,7 @@ func (tcb *TCB) GetNumBytesInSNDBUF() uint16 {
 //
 // [ + + + + * * * + + + ]
 // 10 - (7 - 1 - 3) = 7
+//
 // l                     n
 // [ * * * * * * * * * * ]
 // 10 - (10 - 1 - (-1)) = 0
@@ -530,10 +556,33 @@ func (tcb *TCB) SetCongestionControl(cc string) error {
 	if cc == "none" {
 		tcb.CCEnabled = false
 		tcb.CCAlgo = "N/A"
+		return nil
 	}
 	tcb.CCEnabled = true
 	tcb.CCAlgo = cc
+	tcb.CWND = 3 * 1360
+	tcb.SSThresh = MAX_WND_SIZE
+	tcb.NumBytesACK = 0
+	tcb.CAIncrementFlag = true
+	go CongestionAvoidanceRTT(tcb)
 	return nil
+}
+
+// Function that sets the flag for incrementing cwnd to true every RTT 
+// This is to prevent CWND updates from happening too often 
+// (more than once every RTT)
+func CongestionAvoidanceRTT(tcb *TCB) {
+	for {
+		tick := time.NewTicker(tcb.GetRTO())
+		select {
+		case <-tick.C:
+			{
+				// Can Increment CWND every RTT in Congestion Avoidance mode
+				tcb.CAIncrementFlag = true
+				tick.Reset(tcb.GetRTO())
+			}
+		}
+	}
 }
 
 // Look up on socket table given a 4-tuple
@@ -608,8 +657,6 @@ func CreateTCBForNormalSocket(sid int, laddr netip.Addr, lport uint16,
 		LBW:             0,
 		ProbeStatus:     false,
 		ProbeStopSignal: make(chan bool, 10),
-		CWND:            3 * 1360,
-		SSThresh:        MAX_WND_SIZE,
 		CCEnabled:       false,
 		CCAlgo:          "N/A",
 	}
@@ -617,17 +664,21 @@ func CreateTCBForNormalSocket(sid int, laddr netip.Addr, lport uint16,
 
 // Given "key" and "value", add the pair to the Socket Table
 func AddSocketToTable(key SocketTableKey, value *TCB) {
+	TCPStack.StMtx.Lock()
+	defer TCPStack.StMtx.Unlock()
 	TCPStack.SocketTable[key] = value
 	TCPStack.SIDToTableKey[value.SID] = key
 }
 
 // Given 4-tuple key, remove the associated socket from Socket Table
 func RemoveSocketFromTable(key SocketTableKey) {
+	TCPStack.StMtx.Lock()
 	tcb := TCPStack.SocketTable[key]
 	// Remove from SID to Key map
 	delete(TCPStack.SIDToTableKey, tcb.SID)
 	// Remove from actual Socket Table
 	delete(TCPStack.SocketTable, key)
+	TCPStack.StMtx.Unlock()
 	// If listen sock, un-bind
 	if tcb.State == socket.LISTEN {
 		unbind := tcb.Lport
