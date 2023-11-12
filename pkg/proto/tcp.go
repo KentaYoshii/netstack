@@ -1,6 +1,7 @@
 package proto
 
 import (
+	"errors"
 	"log/slog"
 	"net/netip"
 	"netstack/pkg/packet"
@@ -128,6 +129,18 @@ type TCB struct {
 	ProbeStatus bool
 	// Signal to stop Zero Window Probing
 	ProbeStopSignal chan bool
+
+	// Congestion Control
+
+	// True if using Congestion Control
+	CCEnabled bool
+	// "Reno" or "Tahoe"
+	CCAlgo string
+	// Congestion Window
+	// - Variable that limits the amount of data a TCP can send
+	CWND uint16
+	// Slow Start Threshold
+	SSThresh uint16
 }
 
 type SocketTableKey struct {
@@ -169,7 +182,7 @@ var TCPStack *TCPStackT
 // Log given string with given type
 func Log(msg string, level util.LogLevel) {
 	switch level {
-	case util.DEBUG: 
+	case util.DEBUG:
 		TCPStack.Logger.Debug(msg)
 	case util.INFO:
 		TCPStack.Logger.Info(msg)
@@ -363,6 +376,10 @@ func (tcb *TCB) MergeEAQ(start uint32, currData []byte) ([]byte, uint16) {
 	return currData, uint16(len(currData))
 }
 
+func (tcb *TCB) IsSlowStart() bool {
+	return tcb.CWND < tcb.SSThresh
+}
+
 // Get the bytes in send window given a TCB state
 //
 //	u     n    u+s
@@ -370,6 +387,15 @@ func (tcb *TCB) MergeEAQ(start uint32, currData []byte) ([]byte, uint16) {
 // [+ + + + - - +]
 func (tcb *TCB) GetNumBytesInSNDWND() uint16 {
 	return uint16(tcb.SND_UNA + tcb.SND_WND - tcb.SND_NXT)
+}
+
+// Get the number of in-flight bytes
+//
+//	u         n
+//
+// [+ + + + + - - -]
+func (tcb *TCB) GetNumBytesInFlight() uint16 {
+	return uint16(tcb.SND_NXT - tcb.SND_UNA)
 }
 
 // Gets the number of free bytes in the send buffer
@@ -496,6 +522,20 @@ func (tcb *TCB) IsSegmentValid(tcpPacket *TCPPacket) bool {
 	return cond1 || cond2
 }
 
+// Function that sets the congestion control state for the given socket
+func (tcb *TCB) SetCongestionControl(cc string) error {
+	if cc != "tahoe" && cc != "reno" && cc != "none" {
+		return errors.New("Invalid Congestion Control algorithm provided")
+	}
+	if cc == "none" {
+		tcb.CCEnabled = false
+		tcb.CCAlgo = "N/A"
+	}
+	tcb.CCEnabled = true
+	tcb.CCAlgo = cc
+	return nil
+}
+
 // Look up on socket table given a 4-tuple
 // Returns the TCB and true, if found
 // Returns nil and false, if not found
@@ -568,6 +608,10 @@ func CreateTCBForNormalSocket(sid int, laddr netip.Addr, lport uint16,
 		LBW:             0,
 		ProbeStatus:     false,
 		ProbeStopSignal: make(chan bool, 10),
+		CWND:            3 * 1360,
+		SSThresh:        MAX_WND_SIZE,
+		CCEnabled:       false,
+		CCAlgo:          "N/A",
 	}
 }
 

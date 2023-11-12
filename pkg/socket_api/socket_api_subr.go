@@ -13,16 +13,16 @@ import (
 
 const (
 	// Retransmission
-	MAX_RETRANS      = 3
+	MAX_RETRANS = 3
 	// Retransmission Timeout for Handshake
 	HANDSHAKE_RTO_LB = 1
 	// MSL for Time-Wait
-	MSL              = 5
+	MSL = 5
 	// Maximum Segment Size
 	// - 1400 (Max Packet Size) - 20 (IP hdr) - 20 (TCP hdr)
-	MAX_SEG_SIZE     = 1400 - 20 - 20
+	MAX_SEG_SIZE = 1400 - 20 - 20
 	// Zero Window Probing Initial Timeout
-	ZWP_TO           = 200
+	ZWP_TO = 200
 )
 
 // Function that handles a hadnshake for PASSIVE OPEN
@@ -284,7 +284,7 @@ func _doManageRQ(tcb *proto.TCB) {
 	}
 }
 
-// Function that keeps retransmitting the oldest packet every RTO 
+// Function that keeps retransmitting the oldest packet every RTO
 func _doRetransmit(tcb *proto.TCB) {
 	for {
 		select {
@@ -350,7 +350,7 @@ func _doSend(tcb *proto.TCB, data []byte) {
 }
 
 // Function that handles ACK segments after socket goes into ESTABLISHED state
-// Specifically 
+// Specifically
 // - Check if segment acceptable or not
 // - Check if the segment is early arrival or not
 // - Check data and trim to fit into receive window
@@ -534,14 +534,17 @@ func _handleAckSeg(tcb *proto.TCB, tcpPacket *proto.TCPPacket) (bool, bool) {
 		// Signal the new space in send buffer
 		tcb.SBufPutCond.Signal()
 	} else if tcb.SND_UNA >= SEG_ACK {
-		// check for duplicate ACK
-		// - three conds
-		//   - SND_UNA == SEG_ACK ()
-		//   - SEG_LEN == 0 (no data)
-		//   - SND_UNA != SND_NXT (unacked data)
+		// Check for Duplicate ACK. ACK is duplicate if
+		//   - (1) SND_UNA != SND_NXT (have outstanding data)
+		//   - (2) SEG_LEN == 0 (ACK carries no data)
+		//   - (3) SYN and FIN bits are off
+		//   - (4) SND_UNA == SEG_ACK
+		//   - (5) SND_WND == SEG_WND (no update to advertised window)
 		if (tcb.SND_UNA == SEG_ACK) &&
 			(SEG_LEN == 0) &&
-			(tcb.SND_UNA != tcb.SND_NXT) {
+			(tcb.SND_UNA != tcb.SND_NXT) &&
+			(tcpPacket.TCPHeader.Flags&util.FIN == 0) &&
+			(tcb.SND_WND == uint32(SEG_WND)) {
 			// fmt.Println("Duplicate ACK", "SEG_ACK=", SEG_ACK-tcb.ISS)
 		}
 	} else if SEG_ACK > tcb.SND_NXT {
@@ -713,6 +716,7 @@ func _doActiveClose(tcb *proto.TCB) {
 // - while there is bytes in file
 //   - read MAX_WND_SIZE bytes from the file
 //   - invoke VWRITE
+//
 // - invoke VClose to initiate connection teardown
 func SendFile(tcb *proto.TCB, filepath string, l *slog.Logger) {
 	// Get the handle
@@ -756,6 +760,7 @@ func SendFile(tcb *proto.TCB, filepath string, l *slog.Logger) {
 // - while not EOF
 //   - invoke VRead to receive bytes
 //   - write to the opened file
+//
 // - invoke VClose to end the connection
 func ReceiveFile(tcb *proto.TCB, dest string, l *slog.Logger) {
 	// Get the handle

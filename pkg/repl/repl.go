@@ -86,6 +86,8 @@ func (r *Repl) StartREPL() {
 		r.RegisterCommandHandler("ls", r.handleSocketList)
 		r.RegisterCommandHandler("sf", r.handleSocketSendFile)
 		r.RegisterCommandHandler("rf", r.handleSocketReceiveFile)
+		r.RegisterCommandHandler("lc", r.handleSocketListCongestionAlgo)
+		r.RegisterCommandHandler("sc", r.handleSocketSetCongestionAlgo)
 	}
 
 	// Testing only
@@ -353,15 +355,15 @@ func (r *Repl) handleSocketList(args []string) string {
 
 	sort.Ints(sids)
 
-	b.WriteString(fmt.Sprintf("%-4s%-15s%-7s%-15s%-7s%-10s\n", "---", "-----", "-----", "-----", "-----", "------"))
-	b.WriteString(fmt.Sprintf("%-4s%-15s%-7s%-15s%-7s%-10s\n", "SID", "LAddr", "LPort", "RAddr", "RPort", "Status"))
-	b.WriteString(fmt.Sprintf("%-4s%-15s%-7s%-15s%-7s%-10s\n", "---", "-----", "-----", "-----", "-----", "------"))
+	b.WriteString(fmt.Sprintf("%-5s%-15s%-8s%-15s%-8s%-12s%-12s%-5s\n", "---", "-----", "-----", "-----", "-----", "------", "-------", "----"))
+	b.WriteString(fmt.Sprintf("%-5s%-15s%-8s%-15s%-8s%-12s%-12s%-5s\n", "SID", "LAddr", "LPort", "RAddr", "RPort", "Status", "CC-Algo", "CWND"))
+	b.WriteString(fmt.Sprintf("%-5s%-15s%-8s%-15s%-8s%-12s%-12s%-5s\n", "---", "-----", "-----", "-----", "-----", "------", "-------", "----"))
 
 	for _, sid := range sids {
 		key := proto.TCPStack.SIDToTableKey[sid]
 		tcb := proto.TCPStack.SocketTable[key]
-		b.WriteString(fmt.Sprintf("%-4d%-15s%-7d%-15s%-7d%-10s\n",
-			tcb.SID, tcb.Laddr.String(), tcb.Lport, tcb.Raddr.String(), tcb.Rport, socket.ToSocketStateStr(tcb.State)))
+		b.WriteString(fmt.Sprintf("%-5d%-15s%-8d%-15s%-8d%-12s%-12s%-5d\n",
+			tcb.SID, tcb.Laddr.String(), tcb.Lport, tcb.Raddr.String(), tcb.Rport, socket.ToSocketStateStr(tcb.State), tcb.CCAlgo, tcb.CWND))
 	}
 
 	return b.String()
@@ -372,8 +374,8 @@ func (r *Repl) handleSocketList(args []string) string {
 func (r *Repl) handleSocketSendFile(args []string) string {
 	var b strings.Builder
 
-	if len(args) != 4 {
-		r.HostInfo.Logger.Error("Usage: sf <file path> <ip addr> <port>")
+	if len(args) < 4 {
+		r.HostInfo.Logger.Error("Usage: sf <file path> <ip addr> <port> [tahoe | reno]")
 		return ""
 	}
 
@@ -396,6 +398,13 @@ func (r *Repl) handleSocketSendFile(args []string) string {
 		return ""
 	}
 
+	// Verify CC
+	if len(args) == 5 &&
+		(args[4] != "reno" && args[4] != "tahoe") {
+		r.HostInfo.Logger.Error("CC Algo should either be 'reno' or 'tahoe'")
+		return ""
+	}
+
 	// Get outgoing ip
 	link, valid := r.HostInfo.GetOutgoingLink(ipAddr)
 	if !valid {
@@ -409,6 +418,12 @@ func (r *Repl) handleSocketSendFile(args []string) string {
 		return ""
 	}
 
+	// Turn on Congestion Control if provided
+	if len(args) == 5 {
+		conn.TCB.SetCongestionControl(args[4])
+	}
+
+	// Send file
 	go socket_api.SendFile(conn.TCB, args[1], r.HostInfo.Logger)
 
 	return b.String()
@@ -449,7 +464,7 @@ func (r *Repl) handleSocketReceiveFile(args []string) string {
 	// Accept a single connection
 	tcbChan := make(chan *proto.TCB)
 	go listenSock.VAccept(tcbChan)
-	tcb := <- tcbChan
+	tcb := <-tcbChan
 
 	// Receive file
 	go socket_api.ReceiveFile(tcb, args[1], r.HostInfo.Logger)
@@ -458,6 +473,58 @@ func (r *Repl) handleSocketReceiveFile(args []string) string {
 		r.HostInfo.Logger.Error(err.Error())
 		return ""
 	}
+	return b.String()
+}
+
+// Handle "lc" command
+// - list the congestion control algorithms
+func (r *Repl) handleSocketListCongestionAlgo(args []string) string {
+	var b strings.Builder
+
+	b.WriteString(fmt.Sprintf("%-6s %-15s\n", "----", "-----------"))
+	b.WriteString(fmt.Sprintf("%-6s %-15s\n", "Name", "Description"))
+	b.WriteString(fmt.Sprintf("%-6s %-15s\n", "----", "-----------"))
+
+	b.WriteString(fmt.Sprintf("%-6s %-15s\n", "Tahoe", "Slow Start, Congestion Avoidance, Fast Retransmit"))
+	b.WriteString(fmt.Sprintf("%-6s %-15s\n", "Reno", "TCP Tahoe, Fast Recovery"))
+	return b.String()
+}
+
+// Handle "sc" command (sc <sid> <string>)
+// - set the congestion control algorithm for the socket
+func (r *Repl) handleSocketSetCongestionAlgo(args []string) string {
+	var b strings.Builder
+	if len(args) != 3 {
+		r.HostInfo.Logger.Error("Usage: sc <sid> <algo>")
+		return ""
+	}
+	sid, err := strconv.Atoi(args[1])
+	if err != nil {
+		r.HostInfo.Logger.Error(err.Error())
+		return ""
+	}
+
+	// Get tcb
+	tcb, found := proto.SIDToTCB(sid)
+
+	if !found {
+		// No socket with SID found, error out
+		r.HostInfo.Logger.Error(fmt.Sprintf("Socket with SID=%d does not exist", sid))
+		return ""
+	}
+
+	if tcb.State == socket.LISTEN {
+		// Cannot set cc algo on listen socket
+		r.HostInfo.Logger.Error(fmt.Sprintf("Socket with SID=%d is a listen socket", sid))
+		return ""
+	}
+
+	suc := tcb.SetCongestionControl(args[2])
+	if suc != nil {
+		r.HostInfo.Logger.Error(suc.Error())
+		return ""
+	}
+
 	return b.String()
 }
 
