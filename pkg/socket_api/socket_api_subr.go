@@ -186,11 +186,14 @@ func _activeHandShake(tcb *proto.TCB, i int) bool {
 // retransmission
 func _doMonitorSendBuffer(tcb *proto.TCB) {
 	for {
-		// Wait for the signal
-		tcb.SBufDataCond.L.Lock()
-		tcb.SBufDataCond.Wait()
 		// Get the unsent bytes
 		bytesToSend := tcb.GetNumBytesInSNDBUF()
+		tcb.SBufDataCond.L.Lock()
+		if bytesToSend == 0 {
+			// Wait for the signal
+			tcb.SBufDataCond.Wait()
+		}
+		tcb.SBufDataCond.L.Unlock()
 		// While we have bytes to send out or FIN bit is set
 		for bytesToSend > 0 {
 			// Then check if we have space in snd wnd
@@ -229,7 +232,6 @@ func _doMonitorSendBuffer(tcb *proto.TCB) {
 		}
 		// Emptied!
 		tcb.SBufEmptyCond.Signal()
-		tcb.SBufDataCond.L.Unlock()
 	}
 }
 
@@ -240,7 +242,7 @@ func _doManageRQ(tcb *proto.TCB) {
 	for {
 		tcb.RQUpdateCond.L.Lock()
 		tcb.RQUpdateCond.Wait()
-
+		tcb.RQUpdateCond.L.Unlock()
 		// Some of our in-flight bytes have been ACK'ed
 		updateTime := time.Now()
 		trimPos := 0
@@ -279,7 +281,6 @@ func _doManageRQ(tcb *proto.TCB) {
 			tcb.RetransmissionQ = tcb.RetransmissionQ[trimPos:]
 		}
 		tcb.RQMu.Unlock()
-		tcb.RQUpdateCond.L.Unlock()
 	}
 }
 
@@ -296,6 +297,7 @@ func _doRetransmit(tcb *proto.TCB) {
 				// (5.4) Retransmit the oldest unACK'ed segment
 				tcb.RQMu.Lock()
 				toReTrans := tcb.RetransmissionQ[0]
+				tcb.RQMu.Unlock()
 				// Congestion Control
 				if tcb.CCEnabled {
 					if !toReTrans.IsRetransmit {
@@ -306,11 +308,7 @@ func _doRetransmit(tcb *proto.TCB) {
 						tcb.SSThresh = max(tcb.GetNumBytesInFlight()/2, 2*MAX_SEG_SIZE)
 					}
 					// Upon one RTO, CWND <- MSS, back to "slow start" mode
-					go func() {
-						tick := time.NewTicker(tcb.GetRTO())
-						<-tick.C
-						tcb.CWND = MAX_SEG_SIZE
-					}()
+					tcb.CWND = MAX_SEG_SIZE
 				}
 				toReTrans.IsRetransmit = true
 				toReTrans.Packet.TCPHeader.WindowSize = uint16(tcb.GetAdvertisedWND())
@@ -321,7 +319,6 @@ func _doRetransmit(tcb *proto.TCB) {
 						toReTrans.Packet.TCPHeader.SeqNum-tcb.ISS,
 						tcb.SND_UNA-tcb.ISS, tcb.RTO), util.INFO)
 				tcb.SendChan <- toReTrans.Packet
-				tcb.RQMu.Unlock()
 				// (5.5) RTO <- 2 * RTO
 				tcb.RTO = min(proto.MAX_RTO, 2*tcb.RTO)
 				// (5.6) Restart the Retransmission Timer
@@ -455,7 +452,9 @@ func _handleTextSeg(tcb *proto.TCB, data []byte, dlen uint16) {
 		// Send ACK for everything up until here
 		tcb.SendACKPacket(util.ACK, []byte{})
 		// Signal the reader
+		tcb.RBufDataCond.L.Lock()
 		tcb.RBufDataCond.Signal()
+		tcb.RBufDataCond.L.Unlock()
 	default:
 		// For other states ignore the segment
 		break
@@ -480,7 +479,9 @@ func _handleFinSeg(tcb *proto.TCB, tcpPacket *proto.TCPPacket) bool {
 	// Advance by 1 (FIN)
 	tcb.RCV_NXT += 1
 	// FIN is considered data
+	tcb.RBufDataCond.L.Lock()
 	tcb.RBufDataCond.Signal()
+	tcb.RBufDataCond.L.Unlock()
 	// Send ACK
 	tcb.SendACKPacket(util.ACK, []byte{})
 
@@ -565,15 +566,18 @@ func _handleAckSeg(tcb *proto.TCB, tcpPacket *proto.TCPPacket) (bool, bool) {
 
 		// Update the SND.UNA
 		tcb.SND_UNA = SEG_ACK
-		// - (slow start) cwnd += min(N, MSS) where N is number of bytes newly ACK'ed
 		// (5.3) When an ACK is received that acknowledges
 		// new data, restart the retransmission timer so
 		// that it will expire after RTO seconds
 		tcb.RQTicker.Reset(tcb.GetRTO())
 		// Signal the update to the manager
+		tcb.RQUpdateCond.L.Lock()
 		tcb.RQUpdateCond.Signal()
+		tcb.RQUpdateCond.L.Unlock()
 		// Signal the new space in send buffer
+		tcb.SBufPutCond.L.Lock()
 		tcb.SBufPutCond.Signal()
+		tcb.SBufPutCond.L.Unlock()
 	} else if tcb.SND_UNA >= SEG_ACK {
 		// Check for Duplicate ACK. ACK is duplicate if
 		//   - (1) SND_UNA != SND_NXT (have outstanding data)
@@ -598,14 +602,15 @@ func _handleAckSeg(tcb *proto.TCB, tcpPacket *proto.TCPPacket) (bool, bool) {
 
 	// Update send window
 	if tcb.SND_UNA <= SEG_ACK && SEG_ACK <= tcb.SND_NXT {
-		prevWND := tcb.SND_WND
 		tcb.SND_WND = uint32(SEG_WND)
 		// If window size is 0, we probe
 		if SEG_WND == 0 && !tcb.ProbeStatus {
 			tcb.ProbeStatus = true
 			go _doZWP(tcb)
-		} else if prevWND != tcb.SND_WND {
+		} else {
+			tcb.ACKCond.L.Lock()
 			tcb.ACKCond.Signal()
+			tcb.ACKCond.L.Unlock()
 		}
 	}
 

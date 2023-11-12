@@ -2,7 +2,6 @@ package proto
 
 import (
 	"errors"
-	"fmt"
 	"log/slog"
 	"net/netip"
 	"netstack/pkg/packet"
@@ -401,7 +400,6 @@ func (tcb *TCB) GetNumFreeBytesInSNDWND() uint16 {
 	// the minimum of cwnd and rwnd.
 	//           una     nxt
 	// [A A A A A U U U U - - - - ] (A = ACK'ed, U = unACK'ed, CWND = 6)
-	Log(fmt.Sprintf("RWND_remain=%d, CWND_remain=%d", sndWNDSZ, tcb.CWND-tcb.GetNumBytesInFlight()), util.INFO)
 	return min(tcb.CWND-tcb.GetNumBytesInFlight(), sndWNDSZ)
 }
 
@@ -672,13 +670,11 @@ func AddSocketToTable(key SocketTableKey, value *TCB) {
 
 // Given 4-tuple key, remove the associated socket from Socket Table
 func RemoveSocketFromTable(key SocketTableKey) {
-	TCPStack.StMtx.Lock()
 	tcb := TCPStack.SocketTable[key]
 	// Remove from SID to Key map
 	delete(TCPStack.SIDToTableKey, tcb.SID)
 	// Remove from actual Socket Table
 	delete(TCPStack.SocketTable, key)
-	TCPStack.StMtx.Unlock()
 	// If listen sock, un-bind
 	if tcb.State == socket.LISTEN {
 		unbind := tcb.Lport
